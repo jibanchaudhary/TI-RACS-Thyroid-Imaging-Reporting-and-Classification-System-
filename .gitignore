@@ -1,0 +1,43 @@
+# Virtual env
+.ti_racs_venv/
+venv/
+.env/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Jupyter
+.ipynb_checkpoints/
+
+# PyTorch
+*.pt
+*.pth
+
+# VSCode
+.vscode/
+
+# Linux
+.DS_Store
+
+# Logs
+*.log
+
+# Build
+build/
+dist/
+
+# Dataset
+data/
+datasets/raw/
+
+# Images
+*.jpg
+*.jpeg
+*.png
+*.bmp
+
+# XML annotations
+*.xml
