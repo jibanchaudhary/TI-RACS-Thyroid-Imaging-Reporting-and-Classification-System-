@@ -8,7 +8,7 @@ import torch
 from torch.utils.data import Dataset, WeightedRandomSampler
 
 
-from dataset_conversion import (
+from data_pipeline.dataset_conversion import (
     build_train_transforms,
     build_val_transforms,
     parse_xml_case,
@@ -94,7 +94,7 @@ class ThyroidDataset(Dataset):
             img_path = None
 
             for ext in (".jpg", ".jpeg", ".png"):
-                img_matches = glob.glob(os.path.join(img_dir), f"{img_id}*")
+                img_matches = glob.glob(os.path.join(img_dir, f"{img_id}*"))
                 img_path = img_matches[0]
                 break
 
@@ -123,6 +123,7 @@ class ThyroidDataset(Dataset):
         return [cases[i] for i in splits[which]]
 
     def _print_class_dist(self):
+        dist = None
         from collections import Counter
 
         counts = Counter(c["label"] for c in self.cases)

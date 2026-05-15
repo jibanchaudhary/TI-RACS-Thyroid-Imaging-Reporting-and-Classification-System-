@@ -15,15 +15,14 @@ IMAGENET_STD = [0.229, 0.224, 0.225]
 
 
 TIRADS_MAP = {
-    "": 0,
-    "1": 1,
-    "2": 2,
-    "3": 3,
-    "4": 4,
-    "4a": 4,
-    "4b": 4,
-    "4c": 4,
-    "5": 5,
+    "1": 0,
+    "2": 1,
+    "3": 2,
+    "4": 3,
+    "4a": 3,
+    "4b": 3,
+    "4c": 3,
+    "5": 4,
 }
 
 
@@ -64,6 +63,8 @@ def parse_xml_case(xml_path: str) -> dict | None:
         return None
 
     tirads_raw = (root.findtext("tirads") or "").strip().lower()
+    if tirads_raw == "":
+        return None
     mark = root.find("mark")
 
     img_id = (mark.findtext("image") or "").strip()
