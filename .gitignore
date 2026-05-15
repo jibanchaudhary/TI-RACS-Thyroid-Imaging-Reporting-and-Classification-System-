@@ -41,3 +41,6 @@ datasets/raw/
 
 # XML annotations
 *.xml
+
+# csv files
+*.csv
