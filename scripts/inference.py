@@ -54,11 +54,6 @@ from sklearn.preprocessing import label_binarize
 from torch.utils.data import DataLoader
 
 
-# ---------------------------------------------------------------------------
-# Preprocessing helpers (mirror dataset.py but for a single raw image)
-# ---------------------------------------------------------------------------
-
-
 def preprocess_image(
     img_path: str,
     backbone: str,
@@ -83,11 +78,6 @@ def preprocess_image(
     transform = build_val_transforms(BACKBONE_SIZE[backbone])
     tensor = transform(image=img_rgb)["image"]  # [3, H, W]
     return tensor.unsqueeze(0)  # [1, 3, H, W]
-
-
-# ---------------------------------------------------------------------------
-# Grad-CAM
-# ---------------------------------------------------------------------------
 
 
 class GradCAM:
@@ -201,11 +191,6 @@ def overlay_gradcam(
     return blend
 
 
-# ---------------------------------------------------------------------------
-# Prediction functions
-# ---------------------------------------------------------------------------
-
-
 @torch.no_grad()
 def predict_single(
     model: BackboneModel | EnsembleModel,
@@ -293,11 +278,6 @@ def evaluate_test_set(
     }
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-
 def load_single_backbone(
     checkpoint_path: str, backbone: str, device: torch.device
 ) -> BackboneModel:
@@ -356,9 +336,6 @@ def main():
     )
     print(f"Device: {device}")
 
-    # ------------------------------------------------------------------
-    # MODE: single
-    # ------------------------------------------------------------------
     if args.mode == "single":
         assert (
             args.image and args.checkpoint and args.backbone
@@ -393,9 +370,6 @@ def main():
             cv2.imwrite(out_p, blend)
             print(f"\n  Grad-CAM saved → {out_p}")
 
-    # ------------------------------------------------------------------
-    # MODE: ensemble
-    # ------------------------------------------------------------------
     elif args.mode == "ensemble":
         assert (
             args.image and args.checkpoints
@@ -432,9 +406,6 @@ def main():
             bar = "█" * int(p * 30)
             print(f"    {cls}: {p:.4f} {bar}")
 
-    # ------------------------------------------------------------------
-    # MODE: test
-    # ------------------------------------------------------------------
     elif args.mode == "test":
         assert (
             args.checkpoint and args.backbone
@@ -457,7 +428,6 @@ def main():
         print("Confusion matrix:")
         print(results["confusion_matrix"])
 
-        # Save results
         out_p = os.path.join(args.output_dir, f"test_results_{args.backbone}.txt")
         with open(out_p, "w") as f:
             f.write(f"Backbone:  {args.backbone}\n")

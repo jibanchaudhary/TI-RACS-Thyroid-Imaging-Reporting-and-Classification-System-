@@ -46,11 +46,6 @@ from train.trainer import (
 matplotlib.use("Agg")
 
 
-# ---------------------------------------------------------------------------
-# 5-fold cross-validation for a single backbone
-# ---------------------------------------------------------------------------
-
-
 def run_kfold(
     backbone: str,
     data_dir: str,
@@ -187,11 +182,6 @@ def run_kfold(
     return results
 
 
-# ---------------------------------------------------------------------------
-# Ablation table: run all four backbones, collect mean ± std
-# ---------------------------------------------------------------------------
-
-
 def run_ablation(
     data_dir: str,
     output_dir: str,
@@ -252,11 +242,6 @@ def run_ablation(
 
     print(f"\nAblation table saved → {abl_csv}")
     return all_results
-
-
-# ---------------------------------------------------------------------------
-# Plot helpers
-# ---------------------------------------------------------------------------
 
 
 def _save_confusion_matrix(cm, backbone, fold, path):
@@ -322,10 +307,6 @@ def plot_ablation_bar(ablation_csv: str, output_path: str):
     plt.close(fig)
     print(f"Ablation bar chart saved → {output_path}")
 
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import argparse
