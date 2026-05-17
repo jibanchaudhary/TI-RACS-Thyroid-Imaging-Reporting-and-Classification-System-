@@ -14,6 +14,7 @@ from data_pipeline.dataset_conversion import (
     parse_xml_case,
     polygon_to_mask,
     crop_nodule,
+    export_dataset_to_json,
 )
 
 
@@ -90,11 +91,10 @@ class ThyroidDataset(Dataset):
             if case is None:
                 continue
 
-            img_id = case["image_id"]
+            img_id = case["case_id"]
             img_path = None
-
             for ext in (".jpg", ".jpeg", ".png"):
-                img_matches = glob.glob(os.path.join(img_dir, f"{img_id}*"))
+                img_matches = glob.glob(os.path.join(img_dir, f"{img_id}_*{ext}"))
                 img_path = img_matches[0]
                 break
 
@@ -130,10 +130,6 @@ class ThyroidDataset(Dataset):
         dist = " | ".join(f"{CLASS_NAMES[k]}: {counts[k]}" for k in sorted(counts))
         print(f"  Class dist → {dist}")
 
-    # ------------------------------------------------------------------
-    # Weighted sampler (call this to fix class imbalance in training)
-    # ------------------------------------------------------------------
-
     def get_weighted_sampler(self) -> WeightedRandomSampler:
         from collections import Counter
 
@@ -141,10 +137,6 @@ class ThyroidDataset(Dataset):
         counts = Counter(labels)
         weights = [1.0 / counts[label] for label in labels]
         return WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
-
-    # ------------------------------------------------------------------
-    # Dataset interface
-    # ------------------------------------------------------------------
 
     def __len__(self):
         return len(self.cases)
@@ -176,7 +168,7 @@ class ThyroidDataset(Dataset):
 if __name__ == "__main__":
     data_dir = "/home/jiban/Documents/TI-RACS/anees/dataset/filtered_dataset"
 
-    dataset = ThyroidDataset(
+    train_dataset = ThyroidDataset(
         data_dir=data_dir,
         split="train",
         backbone="convnext",
@@ -184,5 +176,20 @@ if __name__ == "__main__":
         padding=24,
     )
 
-    print("\nFirst case:")
-    print(dataset.cases[0])
+    val_dataset = ThyroidDataset(
+        data_dir=data_dir,
+        split="val",
+        backbone="convnext",
+        crop_nodule=True,
+        padding=24,
+    )
+    export_dataset_to_json(
+        train_dataset, output_dir="/home/jiban/Documents/TI-RACS/artifacts/test_v1/json_dataset"
+    )
+
+    export_dataset_to_json(
+        val_dataset, output_dir="/home/jiban/Documents/TI-RACS/artifacts/test_v1/json_dataset"
+    )
+
+    # print("\nFirst case:")
+    # print(dataset.cases[0])

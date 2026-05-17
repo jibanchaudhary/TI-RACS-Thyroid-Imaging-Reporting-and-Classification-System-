@@ -1,6 +1,8 @@
 import json
 
+import os
 import cv2
+import shutil
 import numpy as np
 
 
@@ -24,6 +26,8 @@ TIRADS_MAP = {
     "4c": 3,
     "5": 4,
 }
+
+CLASS_NAMES = ["TR-1", "TR-2", "TR-3", "TR-4", "TR-5"]
 
 
 def build_train_transforms(img_size: int) -> albun.Compose:
@@ -67,7 +71,7 @@ def parse_xml_case(xml_path: str) -> dict | None:
         return None
     mark = root.find("mark")
 
-    img_id = (mark.findtext("image") or "").strip()
+    # img_id = (mark.findtext("image") or "").strip()
     svg_text = (mark.findtext("svg") or "").strip()
 
     try:
@@ -78,7 +82,8 @@ def parse_xml_case(xml_path: str) -> dict | None:
 
     return {
         "case_id": root.findtext("number", "").strip(),
-        "image_id": img_id,
+        # "image_id": img_id, #######just the croppeed image_id, not the image ########
+        "image_id": root.findtext("number", "").strip(),
         "label": TIRADS_MAP[tirads_raw],
         "tirads_raw": tirads_raw,
         "polygon": polygon,
@@ -117,3 +122,42 @@ def crop_nodule(
     y2 = min(h, ys.max() + padding)
 
     return image[y1:y2, x1:x2], mask[y1:y2, x1:x2]
+
+
+######## Exporting dataset ####################
+def export_dataset_to_json(dataset, output_dir):
+    split_dir = os.path.join(output_dir, dataset.split)
+    os.makedirs(split_dir, exist_ok=True)
+
+    for case in dataset.cases:
+        class_name = CLASS_NAMES[case["label"]]
+        class_dir = os.path.join(split_dir, class_name)
+        os.makedirs(class_dir, exist_ok=True)
+        img_src = case["img_path"]
+        img_name = os.path.basename(img_src)
+
+        img_dst = os.path.join(class_dir, img_name)
+
+        shutil.copy2(img_src, img_dst)
+        json_name = os.path.splitext(img_name)[0] + ".json"
+        json_dst = os.path.join(class_dir, json_name)
+
+        json_data = {
+            "case_id": case["case_id"],
+            "image_id": case["image_id"],
+            "label": case["label"],
+            "class_name": class_name,
+            "tirads_raw": case["tirads_raw"],
+            "polygon": case["polygon"],
+            "age": case["age"],
+            "sex": case["sex"],
+            "composition": case["composition"],
+            "echogenicity": case["echogenicity"],
+            "margins": case["margins"],
+            "calcifications": case["calcifications"],
+        }
+        with open(json_dst, "w") as f:
+            json.dump(json_data, f, indent=4)
+
+    print(f"\nSaved {dataset.split} split to:")
+    print(split_dir)
