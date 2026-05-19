@@ -149,7 +149,7 @@ class EnsembleModel(nn.Module):
         fusion_mode: str = "soft_vote",
         device: str = "cpu",
     ):
-        super.__init__()
+        super().__init__()
         self.fusion_mode = fusion_mode
         self.models = nn.ModuleDict()
         self.device = device
@@ -162,7 +162,7 @@ class EnsembleModel(nn.Module):
                 state = state["model_state_dict"]
             model.load_state_dict(state)
             model.eval()
-            model.models[name] = model
+            self.models[name] = model
 
         if fusion_mode == "concat":
             n_models = len(checkpoint_paths)
@@ -182,7 +182,7 @@ class EnsembleModel(nn.Module):
             all_probs.append(probs)
 
         if self.fusion_mode == "soft_vote":
-            stacked = torch.Stack(all_probs, dim=0)
+            stacked = torch.stack(all_probs, dim=0)
             return stacked.mean(dim=0)
 
         elif self.fusion_mode == "concat":

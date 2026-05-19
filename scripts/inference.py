@@ -49,9 +49,12 @@ from sklearn.metrics import (
     classification_report,
     confusion_matrix,
     roc_auc_score,
+    ConfusionMatrixDisplay,
 )
 from sklearn.preprocessing import label_binarize
+
 from torch.utils.data import DataLoader
+import matplotlib.pyplot as plt
 
 
 def preprocess_image(
@@ -238,7 +241,6 @@ def evaluate_test_set(
     """
     model.eval()
     all_preds, all_labels, all_probs = [], [], []
-
     for images, labels in test_loader:
         images = images.to(device)
         out = model(images)
@@ -248,7 +250,6 @@ def evaluate_test_set(
         all_preds.extend(preds.cpu().tolist())
         all_labels.extend(labels.tolist())
         all_probs.extend(probs.cpu().tolist())
-
     acc = accuracy_score(all_labels, all_preds)
     f1 = f1_score(all_labels, all_preds, average="macro", zero_division=0)
     unique_labels = sorted(set(all_labels) | set(all_preds))
@@ -381,11 +382,8 @@ def main():
         ), "Provide exactly 4 checkpoints: convnext efficientnet swin vit"
 
         ckpt_map = dict(zip(backbone_names, args.checkpoints))
-
         polygon = None
         if args.polygon:
-            import json
-
             polygon = json.loads(args.polygon)
 
         # Ensemble uses a common size (224); resize handled inside each model
@@ -406,6 +404,16 @@ def main():
             bar = "█" * int(p * 30)
             print(f"    {cls}: {p:.4f} {bar}")
 
+        if args.gradcam:
+            gcam = GradCAM(model, args.backbone)
+            heat = gcam(image_tensor.to(device), class_idx=result["predicted_idx"])
+            gcam.remove_hooks()
+
+            blend = overlay_gradcam(args.image, heat)
+            out_p = os.path.join(args.output_dir, f"gradcam_{args.backbone}.png")
+            cv2.imwrite(out_p, blend)
+            print(f"\n  Grad-CAM saved → {out_p}")
+
     elif args.mode == "test":
         assert (
             args.checkpoint and args.backbone
@@ -417,9 +425,7 @@ def main():
         test_loader = DataLoader(
             test_ds, batch_size=16, shuffle=False, num_workers=4, pin_memory=True
         )
-
         results = evaluate_test_set(model, test_loader, device)
-
         print("\n--- Test Set Evaluation ---")
         print(f"  Accuracy  : {results['accuracy']:.4f}")
         print(f"  Macro F1  : {results['macro_f1']:.4f}")
@@ -427,6 +433,28 @@ def main():
         print("\n" + results["classification_report"])
         print("Confusion matrix:")
         print(results["confusion_matrix"])
+
+        cm = results["confusion_matrix"]
+
+        fig, ax = plt.subplots(figsize=(6, 6))
+
+        disp = ConfusionMatrixDisplay(
+            confusion_matrix=cm,
+            display_labels=["TR-2", "TR-3", "TR-4", "TR-5"],
+        )
+
+        disp.plot(ax=ax, cmap="Blues", values_format="d")
+
+        plt.title(f"Confusion Matrix - {args.backbone}")
+        plt.tight_layout()
+
+        cm_png_path = os.path.join(
+            args.output_dir,
+            f"confusion_matrix_{args.backbone}.png",
+        )
+
+        plt.savefig(cm_png_path, dpi=300)
+        plt.close()
 
         out_p = os.path.join(args.output_dir, f"test_results_{args.backbone}.txt")
         with open(out_p, "w") as f:

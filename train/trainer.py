@@ -156,7 +156,7 @@ class Trainer:
         self.train_loader = DataLoader(
             self.train_ds,
             batch_size=batch_size,
-            sampler=sampler,  # handles class imbalance
+            sampler=sampler,
             num_workers=num_workers,
             pin_memory=True,
             drop_last=True,
@@ -204,7 +204,6 @@ class Trainer:
         for batch_idx, (images, labels) in enumerate(self.train_loader):
             images = images.to(self.device, non_blocking=True)
             labels = labels.to(self.device, non_blocking=True)
-
             self.optimizer.zero_grad()
 
             if self.use_amp:

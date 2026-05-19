@@ -67,6 +67,8 @@ class ThyroidDataset(Dataset):
             self.transform = build_train_transforms(self.img_size)
         elif split == "val":
             self.transform = build_val_transforms(self.img_size)
+        elif split == "test":
+            self.transform = build_val_transforms(self.img_size)
 
         all_cases = self._load_all_cases()
         self.cases = self._split(all_cases, train_ratio, val_ratio, seed, split)
@@ -183,6 +185,14 @@ if __name__ == "__main__":
         crop_nodule=True,
         padding=24,
     )
+
+    test_dataset = ThyroidDataset(
+        data_dir=data_dir,
+        split="test",
+        backbone="convnext",
+        crop_nodule=True,
+        padding=24,
+    )
     export_dataset_to_json(
         train_dataset, output_dir="/home/jiban/Documents/TI-RACS/artifacts/test_v1/json_dataset"
     )
@@ -191,5 +201,8 @@ if __name__ == "__main__":
         val_dataset, output_dir="/home/jiban/Documents/TI-RACS/artifacts/test_v1/json_dataset"
     )
 
+    export_dataset_to_json(
+        test_dataset, output_dir="/home/jiban/Documents/TI-RACS/artifacts/test_v1/json_dataset"
+    )
     # print("\nFirst case:")
     # print(dataset.cases[0])
