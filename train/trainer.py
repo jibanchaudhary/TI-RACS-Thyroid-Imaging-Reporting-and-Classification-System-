@@ -40,7 +40,11 @@ from sklearn.metrics import (
 )
 from sklearn.preprocessing import label_binarize
 
-from data_pipeline.create_dataset import ThyroidDataset, CLASS_NAMES, NUM_CLASSES
+from data_pipeline.Binary_classification_create_dataset import (
+    BinaryThyroidDataset,
+    CLASS_NAMES,
+    NUM_CLASSES,
+)
 from models.models import build_model
 import argparse
 
@@ -149,8 +153,8 @@ class Trainer:
         print(f"{'='*60}\n")
 
         # Datasets
-        self.train_ds = ThyroidDataset(data_dir, "train", backbone)
-        self.val_ds = ThyroidDataset(data_dir, "val", backbone)
+        self.train_ds = BinaryThyroidDataset(data_dir, "train", backbone)
+        self.val_ds = BinaryThyroidDataset(data_dir, "val", backbone)
 
         sampler = self.train_ds.get_weighted_sampler()
         self.train_loader = DataLoader(

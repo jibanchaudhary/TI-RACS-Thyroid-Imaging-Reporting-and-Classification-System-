@@ -12,25 +12,10 @@ from data_pipeline.dataset_conversion import (
     build_train_transforms,
     build_val_transforms,
     parse_binary_xml_case,
-    polygon_to_mask,
-    crop_nodule,
-    export_dataset_to_json,
 )
 
-
-########Constants####################
-TIRADS_MAP = {
-    "1": 0,
-    "2": 1,
-    "3": 2,
-    "4": 3,
-    "4a": 3,
-    "4b": 3,
-    "4c": 3,
-    "5": 4,
-}
-CLASS_NAMES = ["TR-1", "TR-2", "TR-3", "TR-4", "TR-5"]
-NUM_CLASSES = 5
+CLASS_NAMES = ["Benign", "Malignant"]
+NUM_CLASSES = 2
 
 
 BACKBONE_SIZE = {
@@ -41,7 +26,7 @@ BACKBONE_SIZE = {
 }
 
 
-class ThyroidDataset(Dataset):
+class BinaryThyroidDataset(Dataset):
     def __init__(
         self,
         data_dir: str,
@@ -89,14 +74,14 @@ class ThyroidDataset(Dataset):
 
         cases = []
         for xml_path in xml_files:
-            case = parse_binary_xml_case(xml_path)  # change this for different classification
+            case = parse_binary_xml_case(xml_path)
             if case is None:
                 continue
 
             img_id = case["case_id"]
             img_path = None
             for ext in (".jpg", ".jpeg", ".png"):
-                img_matches = glob.glob(os.path.join(img_dir, f"{img_id}_*{ext}"))
+                img_matches = glob.glob(os.path.join(img_dir, f"{img_id}*{ext}"))
                 img_path = img_matches[0]
                 break
 
@@ -152,15 +137,12 @@ class ThyroidDataset(Dataset):
             raise IOError(f"Cannot read image: {case['img_path']}")
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         h, w = img_rgb.shape[:2]
+        if "bbox" in case:
+            x_min, y_min, x_max, y_max = case["bbox"]
 
-        # 2. Build binary mask from polygon
-        mask = polygon_to_mask(case["polygon"], h, w)
-
-        # 3. (Optional) crop to nodule ROI
         if self.crop:
-            img_rgb, mask = crop_nodule(img_rgb, mask, self.padding)
+            img_rgb = img_rgb[y_min:y_max, x_min:x_max]
 
-        # 4. Apply transforms (resize, augment, normalize → tensor)
         transformed = self.transform(image=img_rgb)
         image_tensor = transformed["image"]  # shape [3, H, W] float32
 
@@ -170,7 +152,7 @@ class ThyroidDataset(Dataset):
 if __name__ == "__main__":
     data_dir = "/home/jiban/Documents/TI-RACS/anees/dataset/filtered_dataset"
 
-    train_dataset = ThyroidDataset(
+    train_dataset = BinaryThyroidDataset(
         data_dir=data_dir,
         split="train",
         backbone="convnext",
@@ -178,7 +160,7 @@ if __name__ == "__main__":
         padding=24,
     )
 
-    val_dataset = ThyroidDataset(
+    val_dataset = BinaryThyroidDataset(
         data_dir=data_dir,
         split="val",
         backbone="convnext",
@@ -186,23 +168,10 @@ if __name__ == "__main__":
         padding=24,
     )
 
-    test_dataset = ThyroidDataset(
+    test_dataset = BinaryThyroidDataset(
         data_dir=data_dir,
         split="test",
         backbone="convnext",
         crop_nodule=True,
         padding=24,
     )
-    export_dataset_to_json(
-        train_dataset, output_dir="/home/jiban/Documents/TI-RACS/artifacts/test_v1/json_dataset"
-    )
-
-    export_dataset_to_json(
-        val_dataset, output_dir="/home/jiban/Documents/TI-RACS/artifacts/test_v1/json_dataset"
-    )
-
-    export_dataset_to_json(
-        test_dataset, output_dir="/home/jiban/Documents/TI-RACS/artifacts/test_v1/json_dataset"
-    )
-    # print("\nFirst case:")
-    # print(dataset.cases[0])

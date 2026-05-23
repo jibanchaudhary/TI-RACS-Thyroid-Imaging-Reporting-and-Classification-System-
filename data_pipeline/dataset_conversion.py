@@ -26,6 +26,7 @@ TIRADS_MAP = {
     "4c": 3,
     "5": 4,
 }
+BINARY_TIRADS_MAP = {"0": 0, "1": 1}
 
 CLASS_NAMES = ["TR-1", "TR-2", "TR-3", "TR-4", "TR-5"]
 
@@ -57,6 +58,47 @@ def build_val_transforms(img_size: int) -> albun.Compose:
             ToTensorV2(),
         ]
     )
+
+
+"""For binary classes"""
+
+
+def parse_binary_xml_case(xml_path: str) -> dict | None:
+    try:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+    except ET.ParseError:
+        return None
+
+    obj = root.find("object")
+    if obj is None:
+        return None
+
+    label_text = obj.findtext("name", "").strip()
+    if label_text == "":
+        return None
+    bbox = obj.find("bndbox")
+    if bbox is None:
+        return None
+    try:
+        xmin = int(float(bbox.findtext("xmin", "0")))
+        ymin = int(float(bbox.findtext("ymin", "0")))
+        xmax = int(float(bbox.findtext("xmax", "0")))
+        ymax = int(float(bbox.findtext("ymax", "0")))
+    except ValueError:
+        return None
+    filename = root.findtext("filename", "").strip()
+    return {
+        "case_id": os.path.splitext(filename)[0],
+        "image_id": filename,
+        "label": BINARY_TIRADS_MAP[label_text],
+        "bbox": [xmin, ymin, xmax, ymax],
+        "width": int(root.findtext("size/width", "0")),
+        "height": int(root.findtext("size/height", "0")),
+    }
+
+
+"""For multiple classes"""
 
 
 def parse_xml_case(xml_path: str) -> dict | None:
