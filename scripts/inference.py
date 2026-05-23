@@ -156,6 +156,7 @@ class GradCAM:
         if grads.dim() == 3:
             weights = grads.mean(dim=1, keepdim=True)  # [1, 1, C]
             cam = (weights * acts).sum(dim=-1)  # [1, N]
+            cam = cam[:, 1:]
             # Reshape to sqrt(N) × sqrt(N) spatial grid
             n = cam.shape[1]
             s = int(n**0.5)
@@ -192,6 +193,62 @@ def overlay_gradcam(
     color = cv2.applyColorMap(heat8, colormap)
     blend = cv2.addWeighted(orig, 1 - alpha, color, alpha, 0)
     return blend
+
+
+def make_2x2_grid(
+    images_bgr: list[np.ndarray],
+    labels: list[str],
+    grid_size: int = 512,
+    label_height: int = 28,
+    font_scale: float = 0.65,
+) -> np.ndarray:
+    """
+    Arrange exactly 4 BGR images into a 2×2 grid with a label banner per cell.
+
+    Parameters
+    ----------
+    images_bgr : list of 4 BGR uint8 arrays (any size)
+    labels     : list of 4 strings shown above each cell
+    grid_size  : each cell is resized to (grid_size × grid_size) before tiling
+    label_height: pixel height of the label banner
+    font_scale : cv2 font scale for the label text
+
+    Returns
+    -------
+    BGR uint8 array of shape (2*(grid_size+label_height), 2*grid_size, 3)
+    """
+    assert len(images_bgr) == 4 and len(labels) == 4
+
+    cell_w = grid_size
+
+    cells = []
+    for img, label in zip(images_bgr, labels):
+        # Resize to square
+        resized = cv2.resize(img, (grid_size, grid_size))
+
+        # Create label banner (dark background, white text)
+        banner = np.zeros((label_height, cell_w, 3), dtype=np.uint8)
+        text_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
+        tx = (cell_w - text_size[0]) // 2
+        ty = (label_height + text_size[1]) // 2
+        cv2.putText(
+            banner,
+            label,
+            (tx, ty),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
+        cell = np.vstack([banner, resized])  # (cell_h, cell_w, 3)
+        cells.append(cell)
+
+    row0 = np.hstack([cells[0], cells[1]])
+    row1 = np.hstack([cells[2], cells[3]])
+    grid = np.vstack([row0, row1])
+    return grid
 
 
 @torch.no_grad()
@@ -294,7 +351,9 @@ def load_single_backbone(
 
 def main():
     parser = argparse.ArgumentParser(description="TI-RADS inference")
-    parser.add_argument("--mode", choices=["single", "ensemble", "test"], required=True)
+    parser.add_argument(
+        "--mode", choices=["single", "ensemble", "test", "alltogether"], required=True
+    )
     parser.add_argument(
         "--image",
         type=str,
@@ -404,15 +463,56 @@ def main():
             bar = "█" * int(p * 30)
             print(f"    {cls}: {p:.4f} {bar}")
 
-        if args.gradcam:
-            gcam = GradCAM(model, args.backbone)
-            heat = gcam(image_tensor.to(device), class_idx=result["predicted_idx"])
+    elif args.mode == "alltogether":
+        assert (
+            args.image and args.checkpoints
+        ), "--image and --checkpoints required for alltogether mode"
+        assert (
+            len(args.checkpoints) == 4
+        ), "Provide exactly 4 checkpoints: convnext efficientnet swin vit"
+
+        backbone_names = ["convnext", "efficientnet", "swin", "vit"]
+        ckpt_map = dict(zip(backbone_names, args.checkpoints))
+
+        polygon = json.loads(args.polygon) if args.polygon else None
+
+        gcam_images = []
+        gcam_labels = []
+
+        for name, ckpt in ckpt_map.items():
+            print(f"\n  [{name}] Loading checkpoint: {ckpt}")
+            model = load_single_backbone(ckpt, name, device)
+
+            # Preprocess at the correct resolution for this backbone
+            tensor = preprocess_image(args.image, name, polygon=polygon)
+            result = predict_single(model, tensor, device)
+
+            print(
+                f"  [{name}] Predicted: {result['predicted_class']}  "
+                f"(conf {result['confidence']:.1%})"
+            )
+
+            # Grad-CAM
+            gcam = GradCAM(model, name)
+            heat = gcam(tensor.to(device), class_idx=result["predicted_idx"])
             gcam.remove_hooks()
 
             blend = overlay_gradcam(args.image, heat)
-            out_p = os.path.join(args.output_dir, f"gradcam_{args.backbone}.png")
-            cv2.imwrite(out_p, blend)
-            print(f"\n  Grad-CAM saved → {out_p}")
+
+            # Save individual overlay
+            ind_p = os.path.join(args.output_dir, f"gradcam_alltogether_{name}.png")
+            cv2.imwrite(ind_p, blend)
+            print(f"  [{name}] Grad-CAM saved → {ind_p}")
+
+            label = f"{name}  {result['predicted_class']} ({result['confidence']:.0%})"
+            gcam_images.append(blend)
+            gcam_labels.append(label)
+
+        # Save 2×2 grid
+        grid = make_2x2_grid(gcam_images, gcam_labels)
+        grid_p = os.path.join(args.output_dir, "gradcam_alltogether_grid.png")
+        cv2.imwrite(grid_p, grid)
+        print(f"\n  2×2 Grad-CAM grid saved → {grid_p}")
 
     elif args.mode == "test":
         assert (
