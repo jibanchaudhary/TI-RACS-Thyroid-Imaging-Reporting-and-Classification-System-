@@ -20,6 +20,7 @@ Usage
 
 import csv
 import os
+import json
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -31,10 +32,10 @@ from torch.utils.data import (
     Subset,
 )
 
-from data_pipeline.create_dataset import (
+from data_pipeline.Binary_classification_create_dataset import (
     CLASS_NAMES,
     NUM_CLASSES,
-    ThyroidDataset,
+    BinaryThyroidDataset,
 )
 from models.models import build_model
 from scripts.inference import evaluate_test_set
@@ -50,8 +51,8 @@ def run_kfold(
     backbone: str,
     data_dir: str,
     output_dir: str,
-    epochs: int = 30,
-    n_folds: int = 5,
+    epochs: int = 20,
+    n_folds: int = 3,
     batch_size: int = 16,
     lr: float = 3e-4,
     seed: int = 42,
@@ -60,6 +61,10 @@ def run_kfold(
     Returns list of n_folds dicts, each with accuracy, f1, auc.
     Also saves fold-level confusion matrix PNGs.
     """
+
+    ckpt_dir = os.path.join(output_dir, "resume_checkpoints")
+    os.makedirs(ckpt_dir, exist_ok=True)
+
     os.makedirs(os.path.join(output_dir, "confusion_matrices"), exist_ok=True)
 
     device = torch.device(
@@ -71,7 +76,9 @@ def run_kfold(
     )
 
     # Load full dataset (no split — kfold handles it)
-    full_ds = ThyroidDataset(data_dir, "train", backbone, train_ratio=1.0, val_ratio=0.0, seed=seed)
+    full_ds = BinaryThyroidDataset(
+        data_dir, "train", backbone, train_ratio=1.0, val_ratio=0.0, seed=seed
+    )
     all_labels = [full_ds.cases[i]["label"] for i in range(len(full_ds))]
 
     skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
@@ -80,6 +87,14 @@ def run_kfold(
     for fold, (train_idx, val_idx) in enumerate(
         skf.split(np.zeros(len(full_ds)), all_labels), start=1
     ):
+        ckpt_path = os.path.join(ckpt_dir, f"{backbone}_fold{fold}.pt")
+        done_path = os.path.join(ckpt_dir, f"{backbone}_fold{fold}_done.json")
+        if os.path.exists(done_path):
+            with open(done_path) as f:
+                results.append(json.load(f))
+            print(f"Skipping fold {fold}")
+            continue
+
         print(f"\n{'='*55}")
         print(f" {backbone.upper()}  |  Fold {fold}/{n_folds}")
         print(f"{'='*55}")
@@ -125,7 +140,24 @@ def run_kfold(
         best_val_loss = float("inf")
         best_state = None
 
-        for epoch in range(1, epochs + 1):
+        resume_epoch = 1
+        if os.path.exists(ckpt_path):
+            print(f"Resuming_{backbone}_fold:{fold}")
+            ckpt = torch.load(ckpt_path, map_location=device)
+            model.load_state_dict(ckpt["model"])
+            optimizer.load_state_dict(ckpt["optimizer"])
+            scheduler.load_state_dict(ckpt["scheduler"])
+            best_val_loss = ckpt["best_val_loss"]
+            best_state = ckpt["best_state"]
+            resume_epoch = ckpt["epoch"] + 1
+            print(
+                f"Loaded checkpoint: "
+                f"epoch {ckpt['epoch']} "
+                f"→ resuming at "
+                f"epoch {resume_epoch}"
+            )
+
+        for epoch in range(resume_epoch, epochs + 1):
             model.train()
             model.on_epoch_start(epoch)
             for images, labels in train_loader:
@@ -152,6 +184,17 @@ def run_kfold(
 
                 best_state = copy.deepcopy(model.state_dict())
 
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                    "best_val_loss": best_val_loss,
+                    "best_state": best_state,
+                },
+                ckpt_path,
+            )
         # Evaluate best state
         model.load_state_dict(best_state)
         fold_metrics = evaluate_test_set(model, val_loader, device)
@@ -162,14 +205,15 @@ def run_kfold(
             f"auc {fold_metrics['macro_auc']:.4f}"
         )
 
-        results.append(
-            {
-                "fold": fold,
-                "accuracy": fold_metrics["accuracy"],
-                "macro_f1": fold_metrics["macro_f1"],
-                "macro_auc": fold_metrics["macro_auc"],
-            }
-        )
+        result = {
+            "fold": fold,
+            "accuracy": fold_metrics["accuracy"],
+            "macro_f1": fold_metrics["macro_f1"],
+            "macro_auc": fold_metrics["macro_auc"],
+        }
+        results.append(result)
+        with open(done_path, "w") as f:
+            json.dump(result, f)
 
         # Save confusion matrix
         _save_confusion_matrix(
@@ -178,6 +222,8 @@ def run_kfold(
             fold,
             os.path.join(output_dir, "confusion_matrices", f"{backbone}_fold{fold}.png"),
         )
+        if os.path.exists(ckpt_path):
+            os.remove(ckpt_path)
 
     return results
 
