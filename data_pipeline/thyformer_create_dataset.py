@@ -16,6 +16,14 @@ from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 from configs.thyformer_config import AugmentationConfig, DataConfig
 
+TIRADS_MAP = {
+    "TR-1": 0,
+    "TR-2": 1,
+    "TR-3": 2,
+    "TR-4": 3,
+    "TR-5": 3,
+}
+
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
@@ -117,13 +125,23 @@ class ThyroidDataset(Dataset):
         img = np.stack([img, img, img], axis=-1)  # [H,W,3]
         return (img * 255).astype(np.uint8)
 
-    def _load_mask(self, row: pd.Series) -> np.ndarray:
-        if self.has_masks and pd.notna(row.get("mask_path")):
-            p = self.root / row["mask_path"]
-            m = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
-            if m is not None:
-                return (m > 127).astype(np.uint8)
-        return np.zeros((224, 224), dtype=np.uint8)
+    def _load_mask(self, row: pd.Series, img_shape) -> np.ndarray:
+        img_h, img_w = img_shape
+        mask_str = row.get("mask", "")
+        if pd.isna(mask_str) or not mask_str:
+            return np.zeros((img_h, img_w), dtype=np.uint8)
+
+        try:
+            pairs = mask_str.split(";")
+            pts = np.array(
+                [[int(c) for c in p.split(",")] for p in pairs if "," in p],
+                dtype=np.int32,
+            )
+            mask = np.zeros((img_h, img_w), dtype=np.uint8)
+            cv2.fillPoly(mask, [pts], 255)
+            return (mask > 127).astype(np.uint8)
+        except Exception:
+            return np.zeros((img_h, img_w), dtype=np.uint8)
 
     def _load_boundary(self, stem: str) -> np.ndarray:
         if self.medsam_dir is not None:
@@ -134,10 +152,10 @@ class ThyroidDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         row = self.df.iloc[idx]
-        stem = Path(row["image_path"]).stem
-        image = self._load_image(row["image_path"])
-        mask = self._load_mask(row)
-        label = int(row["label"])
+        stem = Path(row["img_path"]).stem
+        image = self._load_image(row["img_path"])
+        mask = self._load_mask(row, image.shape[:2])
+        label = TIRADS_MAP[row["label"]]
 
         if self.transform is not None:
             aug = self.transform(image=image, mask=mask)
@@ -185,9 +203,10 @@ def mixup_collate(batch: List[Dict], alpha: float = 0.2, p: float = 0.3, num_cla
 
 def build_weighted_sampler(ds: ThyroidDataset) -> WeightedRandomSampler:
     labels = ds.df["label"].values
-    counts = np.bincount(labels, minlength=4)
+    numeric_labels = np.array([TIRADS_MAP[label] for label in labels])
+    counts = np.bincount(numeric_labels, minlength=4)
     weights = 1.0 / np.maximum(counts, 1)
-    s_weights = torch.from_numpy(weights[labels]).float()
+    s_weights = torch.from_numpy(weights[numeric_labels]).float()
     return WeightedRandomSampler(s_weights, len(s_weights), replacement=True)
 
 
