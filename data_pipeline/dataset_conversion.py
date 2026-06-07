@@ -1,5 +1,5 @@
 import json
-
+import csv
 import os
 import cv2
 import shutil
@@ -161,3 +161,60 @@ def export_dataset_to_json(dataset, output_dir):
 
     print(f"\nSaved {dataset.split} split to:")
     print(split_dir)
+
+
+####Create a csv file from the the images and json data file ########
+def create_dataset_csv(data_dir, output_csv):
+    rows = []
+    for subfolder in sorted(os.listdir(data_dir)):
+        folder_path = os.path.join(data_dir, subfolder)
+        if not os.path.isdir(folder_path):
+            continue
+        for f in sorted(os.listdir(folder_path)):
+            if not f.endswith(".json"):
+                continue
+            img_path = os.path.join(subfolder, f.replace(".json", ".jpg"))
+            with open(os.path.join(folder_path, f)) as jf:
+                data = json.load(jf)
+            label = data.get("class_name", subfolder)
+            polygon = data.get("polygon", [])
+            mask = ";".join(f"{p['x']},{p['y']}" for p in polygon)
+            rows.append([img_path, label, mask])
+
+    with open(output_csv, "w", newline="") as cf:
+        w = csv.writer(cf)
+        w.writerow(["img_path", "label", "mask"])
+        w.writerows(rows)
+    print(f"Done: {len(rows)} rows written to {output_csv}")
+
+
+#### split the dataset into train, val and test csv files ########
+def split_dataset_csv(
+    input_csv, output_dir, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15, random_seed=42
+):
+    train_csv = os.path.join(output_dir, "train.csv")
+    val_csv = os.path.join(output_dir, "val.csv")
+    test_csv = os.path.join(output_dir, "test.csv")
+
+    with open(input_csv, "r") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+    np.random.seed(random_seed)
+    np.random.shuffle(rows)
+
+    total = len(rows)
+    train_end = int(total * train_ratio)
+    val_end = train_end + int(total * val_ratio)
+
+    splits = {
+        "train": rows[:train_end],
+        "val": rows[train_end:val_end],
+        "test": rows[val_end:],
+    }
+    for split_name, split_rows in splits.items():
+        output_csv = {"train": train_csv, "val": val_csv, "test": test_csv}[split_name]
+        with open(output_csv, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["img_path", "label", "mask"])
+            w.writerows([r["img_path"], r["label"], r["mask"]] for r in split_rows)
+        print(f"{split_name}: {len(split_rows)} rows → {output_csv}")
