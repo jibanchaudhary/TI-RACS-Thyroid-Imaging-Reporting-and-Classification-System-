@@ -22,14 +22,9 @@ from torch.utils.data import DataLoader
 
 from configs.thyformer_config import ThyFormerConfig
 from utils.thyformer_loss import ThyFormerLoss
-from models.Thyformer_models import ThyFormer
+from models.thyformer_models import ThyFormer
 from utils.thyformer_metrics import compute_metrics
 from utils.thyformer_logging import MetricLogger
-
-
-# ─────────────────────────────────────────────────────────────────
-# Optimizer & scheduler
-# ─────────────────────────────────────────────────────────────────
 
 
 def build_optimizer(model: ThyFormer, cfg: ThyFormerConfig) -> AdamW:
@@ -57,11 +52,6 @@ def apply_warmup(opt: AdamW, step: int, warmup_steps: int, lr_bb: float, lr_h: f
         opt.param_groups[1]["lr"] = lr_h * f
 
 
-# ─────────────────────────────────────────────────────────────────
-# Early stopping
-# ─────────────────────────────────────────────────────────────────
-
-
 class EarlyStopping:
     def __init__(self, patience: int = 10, mode: str = "max"):
         self.patience = patience
@@ -80,11 +70,6 @@ class EarlyStopping:
             if self.counter >= self.patience:
                 self.stop = True
         return self.stop
-
-
-# ─────────────────────────────────────────────────────────────────
-# Checkpoint manager
-# ─────────────────────────────────────────────────────────────────
 
 
 class CheckpointManager:
@@ -120,11 +105,6 @@ class CheckpointManager:
     @property
     def best(self) -> Optional[Path]:
         return self.saved[0][1] if self.saved else None
-
-
-# ─────────────────────────────────────────────────────────────────
-# Single epoch — train
-# ─────────────────────────────────────────────────────────────────
 
 
 def train_one_epoch(
@@ -175,11 +155,6 @@ def train_one_epoch(
     return m, global_step
 
 
-# ─────────────────────────────────────────────────────────────────
-# Single epoch — evaluate
-# ─────────────────────────────────────────────────────────────────
-
-
 @torch.no_grad()
 def evaluate(model, loader, loss_fn, epoch, prefix="val", cfg=None):
     model.eval()
@@ -206,11 +181,6 @@ def evaluate(model, loader, loss_fn, epoch, prefix="val", cfg=None):
     m = compute_metrics(logits, labels, prefix=prefix)
     m[f"{prefix}_loss"] = total_loss / len(loader)
     return m
-
-
-# ─────────────────────────────────────────────────────────────────
-# Main training loop
-# ─────────────────────────────────────────────────────────────────
 
 
 def train(
@@ -311,10 +281,6 @@ def _print_test(m):
     print("=" * 55)
 
 
-# ─────────────────────────────────────────────────────────────────
-# Entry point — run training directly
-# ─────────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
     import argparse
 
@@ -366,7 +332,7 @@ if __name__ == "__main__":
 
     # Import here to avoid circular imports at module level
     from data_pipeline.thyformer_create_dataset import build_dataloaders
-    from models.Thyformer_models import build_model
+    from models.thyformer_models import build_model
     from utils.thyformer_loss import build_loss
 
     # Build everything
