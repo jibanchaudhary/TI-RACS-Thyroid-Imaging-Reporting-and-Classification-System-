@@ -42,5 +42,8 @@ datasets/raw/
 # XML annotations
 *.xml
 
-# csv files
+# extensions
 *.csv
+*.json
+*.npy
+*.txt
