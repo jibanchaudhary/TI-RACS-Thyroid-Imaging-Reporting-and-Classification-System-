@@ -30,8 +30,12 @@ build/
 dist/
 
 # Dataset
+stanford_dataset/
+dataset/
 data/
 datasets/raw/
+anees/
+artifacts/
 
 # Images
 *.jpg
