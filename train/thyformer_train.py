@@ -78,22 +78,43 @@ class CheckpointManager:
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.top_k = top_k
         self.saved: List[tuple] = []  # (score, path)
+        self._scan_existing()
+
+    def _scan_existing(self):
+        """Rebuild saved list from any .pt files already on disk (needed for resume)."""
+        for p in sorted(self.save_dir.glob("ep*_auc*.pt")):
+            try:
+                auc_str = p.stem.split("_auc")[-1]
+                score = float(auc_str)
+                self.saved.append((score, p))
+            except ValueError:
+                pass
+        self.saved.sort(key=lambda x: x[0], reverse=True)
 
     def save(
-        self, model: ThyFormer, opt: AdamW, epoch: int, metrics: Dict, cfg: ThyFormerConfig
+        self,
+        model: ThyFormer,
+        opt: AdamW,
+        epoch: int,
+        metrics: Dict,
+        cfg: ThyFormerConfig,
+        scheduler=None,
+        scaler=None,
     ) -> Path:
         score = metrics.get("val_auc", 0.0)
         path = self.save_dir / f"ep{epoch:03d}_auc{score:.4f}.pt"
-        torch.save(
-            {
-                "epoch": epoch,
-                "model": model.state_dict(),
-                "optimizer": opt.state_dict(),
-                "metrics": metrics,
-                "config": cfg,
-            },
-            path,
-        )
+        payload = {
+            "epoch": epoch,
+            "model": model.state_dict(),
+            "optimizer": opt.state_dict(),
+            "metrics": metrics,
+            "config": cfg,
+        }
+        if scheduler is not None:
+            payload["scheduler"] = scheduler.state_dict()
+        if scaler is not None:
+            payload["scaler"] = scaler.state_dict()
+        torch.save(payload, path)
         self.saved.append((score, path))
         self.saved.sort(key=lambda x: x[0], reverse=True)
         while len(self.saved) > self.top_k:
@@ -188,6 +209,7 @@ def train(
     dataloaders: Dict[str, DataLoader],
     loss_fn: ThyFormerLoss,
     cfg: ThyFormerConfig,
+    resume_from: Optional[str] = None,
 ) -> Dict:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
@@ -204,6 +226,26 @@ def train(
     )
     best_metrics = {}
     global_step = 0
+    start_epoch = 0
+
+    if resume_from:
+        resume_path = Path(resume_from)
+        if not resume_path.exists():
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_from}")
+        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model"])
+        opt.load_state_dict(ckpt["optimizer"])
+        if "scheduler" in ckpt:
+            sched.load_state_dict(ckpt["scheduler"])
+        if "scaler" in ckpt:
+            scaler.load_state_dict(ckpt["scaler"])
+        start_epoch = ckpt["epoch"] + 1
+        global_step = start_epoch * len(dataloaders["train"])
+        prev_metric = ckpt["metrics"].get(cfg.training.early_stopping_metric, stopper.best)
+        stopper.best = prev_metric
+        print(
+            f"Resumed from {resume_path.name}  (epoch {ckpt['epoch']} → continuing at {start_epoch})"
+        )
 
     print(f"\nTraining ThyFormer on {device}")
     print(
@@ -213,7 +255,7 @@ def train(
     )
     print("─" * 60)
 
-    for epoch in range(cfg.training.epochs):
+    for epoch in range(start_epoch, cfg.training.epochs):
         t0 = time.time()
 
         train_m, global_step = train_one_epoch(
@@ -234,7 +276,7 @@ def train(
         logger.log_epoch({**train_m, **val_m, "epoch": epoch})
         _print_epoch(epoch, time.time() - t0, train_m, val_m)
 
-        ckpt_mgr.save(model, opt, epoch, val_m, cfg)
+        ckpt_mgr.save(model, opt, epoch, val_m, cfg, scheduler=sched, scaler=scaler)
 
         watch = val_m.get(cfg.training.early_stopping_metric, 0.0)
         if watch == stopper.best:
@@ -298,6 +340,7 @@ if __name__ == "__main__":
     parser.add_argument("--wandb", action="store_true", help="Enable W&B logging")
     parser.add_argument("--experiment", default=None, help="Experiment name")
     parser.add_argument("--checkpoint_dir", default=None)
+    parser.add_argument("--resume", default=None, help="Path to checkpoint .pt file to resume from")
     args = parser.parse_args()
 
     # Load config and apply CLI overrides
@@ -343,5 +386,5 @@ if __name__ == "__main__":
     )
 
     # Train
-    results = train(model, loaders, loss_fn, cfg)
+    results = train(model, loaders, loss_fn, cfg, resume_from=args.resume)
     print("\nDone. Final results:", results)
