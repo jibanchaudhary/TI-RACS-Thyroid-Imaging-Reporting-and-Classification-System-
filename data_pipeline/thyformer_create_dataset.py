@@ -104,6 +104,7 @@ class ThyroidDataset(Dataset):
         medsam_masks_dir: Optional[str] = None,
         aug_cfg: Optional[AugmentationConfig] = None,
         is_train: bool = True,
+        image_size: int = 224,
     ):
         self.df = pd.read_csv(csv_path)
         self.root = Path(data_root)
@@ -111,6 +112,7 @@ class ThyroidDataset(Dataset):
         self.medsam_dir = Path(medsam_masks_dir) if medsam_masks_dir else None
         self.aug_cfg = aug_cfg or AugmentationConfig()
         self.is_train = is_train
+        self.image_size = image_size
         self.has_masks = "mask_path" in self.df.columns
 
     def __len__(self) -> int:
@@ -148,7 +150,7 @@ class ThyroidDataset(Dataset):
             p = self.medsam_dir / f"{stem}.npy"
             if p.exists():
                 return np.load(str(p)).astype(np.float32)
-        return np.zeros((224, 224), dtype=np.float32)
+        return np.zeros((self.image_size, self.image_size), dtype=np.float32)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         row = self.df.iloc[idx]
@@ -163,7 +165,11 @@ class ThyroidDataset(Dataset):
             mask = aug["mask"]  # Tensor [H,W]
 
         boundary = (
-            torch.from_numpy(cv2.resize(self._load_boundary(stem), (224, 224))).float().unsqueeze(0)
+            torch.from_numpy(
+                cv2.resize(self._load_boundary(stem), (self.image_size, self.image_size))
+            )
+            .float()
+            .unsqueeze(0)
         )
 
         if isinstance(mask, np.ndarray):
@@ -221,13 +227,31 @@ def build_dataloaders(
     val_tf = build_val_transforms(data_cfg.image_size)
 
     train_ds = ThyroidDataset(
-        data_cfg.train_csv, data_cfg.data_root, train_tf, data_cfg.medsam_masks_dir, aug_cfg, True
+        data_cfg.train_csv,
+        data_cfg.data_root,
+        train_tf,
+        data_cfg.medsam_masks_dir,
+        aug_cfg,
+        True,
+        image_size=data_cfg.image_size,
     )
     val_ds = ThyroidDataset(
-        data_cfg.val_csv, data_cfg.data_root, val_tf, data_cfg.medsam_masks_dir, aug_cfg, False
+        data_cfg.val_csv,
+        data_cfg.data_root,
+        val_tf,
+        data_cfg.medsam_masks_dir,
+        aug_cfg,
+        False,
+        image_size=data_cfg.image_size,
     )
     test_ds = ThyroidDataset(
-        data_cfg.test_csv, data_cfg.data_root, val_tf, data_cfg.medsam_masks_dir, aug_cfg, False
+        data_cfg.test_csv,
+        data_cfg.data_root,
+        val_tf,
+        data_cfg.medsam_masks_dir,
+        aug_cfg,
+        False,
+        image_size=data_cfg.image_size,
     )
 
     sampler = build_weighted_sampler(train_ds)

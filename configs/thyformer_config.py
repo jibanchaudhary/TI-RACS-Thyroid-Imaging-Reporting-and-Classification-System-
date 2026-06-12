@@ -8,12 +8,12 @@ from typing import List, Tuple
 
 @dataclass
 class DataConfig:
-    data_root: str = "/home/jiban/Documents/TI-RACS/anees/dataset/img_json"
-    train_csv: str = "/home/jiban/Documents/TI-RACS/anees/dataset/csv/train.csv"
-    val_csv: str = "/home/jiban/Documents/TI-RACS/anees/dataset/csv/val.csv"
-    test_csv: str = "/home/jiban/Documents/TI-RACS/anees/dataset/csv/test.csv"
-    medsam_masks_dir: str = "/home/jiban/Documents/TI-RACS/anees/dataset/med_sam"
-    image_size: int = 224
+    data_root: str = "/home/jiban/Documents/TI-RACS/stanford_dataset/images"
+    train_csv: str = "/home/jiban/Documents/TI-RACS/stanford_dataset/train.csv"
+    val_csv: str = "/home/jiban/Documents/TI-RACS/stanford_dataset/val.csv"
+    test_csv: str = "/home/jiban/Documents/TI-RACS/stanford_dataset/test.csv"
+    medsam_masks_dir: str = "/home/jiban/Documents/TI-RACS/stanford_dataset/med_sam"
+    image_size: int = 720
     in_channels: int = 3
     num_classes: int = 4
     class_names: List[str] = field(default_factory=lambda: ["T1", "T2", "T3", "T4"])
@@ -40,6 +40,7 @@ class AugmentationConfig:
 @dataclass
 class ModelConfig:
     backbone: str = "swin_tiny_patch4_window7_224"
+    img_size: int = 720  # must match DataConfig.image_size; timm rebuilds window masks for it
     pretrained: bool = True
     stem_kernel_size: int = 3
     stem_out_channels: int = 96  # must match Swin-T embedding dim
@@ -66,7 +67,7 @@ class LossConfig:
 @dataclass
 class TrainingConfig:
     epochs: int = 50
-    batch_size: int = 16
+    batch_size: int = 4  # 720x720 has ~10x the tokens of 224; 8GB GPU limit
     num_workers: int = 4
     pin_memory: bool = True
     fp16: bool = True
@@ -82,13 +83,13 @@ class TrainingConfig:
     early_stopping_patience: int = 10
     early_stopping_metric: str = "val_loss"
     early_stopping_mode: str = "min"
-    checkpoint_dir: str = "checkpoints"
+    checkpoint_dir: str = "artifacts/thyformer_v2_720/checkpoints"
     save_top_k: int = 3
     log_dir: str = "logs"
     log_interval: int = 10
     use_wandb: bool = False
     project_name: str = "thyformer"
-    experiment_name: str = "thyformer_v1"
+    experiment_name: str = "thyformer_v2"
     seed: int = 42
 
 

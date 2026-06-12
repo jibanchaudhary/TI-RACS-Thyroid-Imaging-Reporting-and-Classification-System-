@@ -162,11 +162,11 @@ class ThyFormerLoss(nn.Module):
         """
         preds:
             cls_logits  [B,4]
-            seg_logits  [B,1,224,224]
+            seg_logits  [B,1,H,W]
         targets:
             label       [B,4] soft | [B] hard
-            mask        [B,1,224,224]
-            boundary    [B,1,224,224]
+            mask        [B,1,H,W]
+            boundary    [B,1,H,W]
         """
         l_ce = self.ce(preds["cls_logits"], targets["label"])
         l_dice = self.dice(preds["seg_logits"], targets["mask"])

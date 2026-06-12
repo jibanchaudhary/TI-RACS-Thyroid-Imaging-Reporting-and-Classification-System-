@@ -62,7 +62,7 @@ IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 
-def preprocess_image(path: str, image_size: int = 224) -> torch.Tensor:
+def preprocess_image(path: str, image_size: int = 720) -> torch.Tensor:
     """
     Load and preprocess a single ultrasound image.
     Returns: float32 tensor [1, 3, H, W] ready for the model.
@@ -93,7 +93,7 @@ def preprocess_image(path: str, image_size: int = 224) -> torch.Tensor:
     return tensor.float()
 
 
-def load_original_rgb(path: str, image_size: int = 224) -> np.ndarray:
+def load_original_rgb(path: str, image_size: int = 720) -> np.ndarray:
     """Load original image as uint8 RGB [H, W, 3] for overlay."""
     img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
     if img is None:
@@ -129,7 +129,7 @@ def predict_single(
     image_path: str,
     device: str = "cuda",
     fp16: bool = True,
-    image_size: int = 224,
+    image_size: int = 720,
 ) -> Dict:
     """
     Run inference on one image.
@@ -215,7 +215,7 @@ def run_batch(
     fp16: bool = True,
     save_masks: bool = False,
     gradcam: bool = False,
-    image_size: int = 224,
+    image_size: int = 720,
 ) -> List[Dict]:
     """
     Run inference on a list of images.
@@ -421,7 +421,7 @@ def parse_args():
     p.add_argument("--save_masks", action="store_true", help="Save predicted segmentation masks")
     p.add_argument("--no_fp16", action="store_true", help="Disable FP16 mixed precision")
     p.add_argument("--device", default=None, help="cuda / cpu  (auto-detected if not set)")
-    p.add_argument("--image_size", type=int, default=224)
+    p.add_argument("--image_size", type=int, default=720)
     p.add_argument(
         "--image_root", default=None, help="Root directory prepended to relative paths in --csv"
     )

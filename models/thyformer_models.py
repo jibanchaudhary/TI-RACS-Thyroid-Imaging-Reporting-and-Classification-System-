@@ -48,7 +48,7 @@ class DespecklingCNNStem(nn.Module):
             self.dw.weight.data.copy_(ker.unsqueeze(0).unsqueeze(0).expand(self.dw.weight.shape))
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, int, int]:
-        """x: [B,3,224,224]  →  tokens: [B,H*W,C], H, W"""
+        """x: [B,3,H,W]  →  tokens: [B,(H/4)*(W/4),C], H/4, W/4"""
         x = self.act(self.norm(self.pw(self.dw(x))))
         x = self.pe(x)  # [B,C,H/4,W/4]
         B, C, H, W = x.shape
@@ -118,7 +118,7 @@ class ClassificationHead(nn.Module):
 class FPNDecoder(nn.Module):
     """
     Feature Pyramid Network fusing F1–F4 (top-down pathway).
-    Outputs binary nodule mask at 224×224.
+    Outputs binary nodule mask at the input image resolution.
 
     Swin-T channels: F1=96, F2=192, F3=384, F4=768
     """
@@ -143,10 +143,11 @@ class FPNDecoder(nn.Module):
             nn.Conv2d(fpn_ch // 2, seg_cls, 1),
         )
 
-    def forward(self, features: List[torch.Tensor]) -> torch.Tensor:
+    def forward(self, features: List[torch.Tensor], out_size: Tuple[int, int]) -> torch.Tensor:
         """
         features: [F1,F2,F3,F4] each [B,Hi,Wi,Ci] (channel-last from Swin)
-        returns:  [B,1,224,224]
+        out_size: (H, W) of the input image
+        returns:  [B,1,H,W]
         """
         fs = [f.permute(0, 3, 1, 2).contiguous() for f in features]
         lats = [lat(f) for lat, f in zip(self.lateral, fs)]
@@ -157,9 +158,9 @@ class FPNDecoder(nn.Module):
                 lats[i + 1], size=lats[i].shape[-2:], mode="bilinear", align_corners=False
             )
 
-        p1 = self.smooth[0](lats[0])  # [B,fpn,56,56]
-        p1 = F.interpolate(p1, (224, 224), mode="bilinear", align_corners=False)
-        return self.head(p1)  # [B,1,224,224]
+        p1 = self.smooth[0](lats[0])  # [B,fpn,H/4,W/4]
+        p1 = F.interpolate(p1, out_size, mode="bilinear", align_corners=False)
+        return self.head(p1)  # [B,1,H,W]
 
 
 class ThyFormer(nn.Module):
@@ -167,9 +168,9 @@ class ThyFormer(nn.Module):
     ThyFormer — hybrid CNN-Transformer for thyroid nodule TI-RADS classification.
 
     Forward returns:
-        cls_logits   [B,4]           — TI-RADS class probabilities
-        seg_logits   [B,1,224,224]   — nodule mask logits
-        echo_weights [B,3]           — echogenicity bin activations
+        cls_logits   [B,4]       — TI-RADS class probabilities
+        seg_logits   [B,1,H,W]   — nodule mask logits (input resolution)
+        echo_weights [B,3]       — echogenicity bin activations
     """
 
     SWIN_T_CH = [96, 192, 384, 768]  # Swin-T stage output channels
@@ -193,11 +194,14 @@ class ThyFormer(nn.Module):
         )
 
         # Stage 3 — timm Swin backbone (features_only bypasses cls head)
+        # img_size must match the training resolution: Swin precomputes its
+        # shifted-window attention masks at init for this resolution.
         self.swin = timm.create_model(
             cfg.backbone,
             pretrained=cfg.pretrained,
             features_only=True,
             drop_path_rate=cfg.drop_path_rate,
+            img_size=cfg.img_size,
         )
 
         if cfg.freeze_stages > 0:
@@ -233,22 +237,21 @@ class ThyFormer(nn.Module):
     # ── Forward ───────────────────────────────────────────────────
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """x: [B,3,224,224]"""
+        """x: [B,3,H,W] with H,W divisible by the stem patch size"""
         # Stage 1 — Despeckling stem
-        tokens, H, W = self.stem(x)  # [B,3136,96]
+        tokens, H, W = self.stem(x)  # [B,(H/4)*(W/4),96]
 
         # Stage 2 — Echogenicity attention
-        tokens, echo_w = self.eca(tokens)  # [B,3136,96]
+        tokens, echo_w = self.eca(tokens)
 
         # Stage 3 — Swin encoder
         features = self._run_swin_stages(tokens, H, W)
-        # features[-1]: [B,7,7,768]
 
         # Stage 4a — Classification
         cls_logits = self.cls_head(features[-1])  # [B,4]
 
         # Stage 4b — Segmentation
-        seg_logits = self.fpn(features)  # [B,1,224,224]
+        seg_logits = self.fpn(features, x.shape[-2:])  # [B,1,H,W]
 
         return {
             "cls_logits": cls_logits,
