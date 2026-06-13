@@ -27,6 +27,18 @@ from utils.thyformer_metrics import compute_metrics
 from utils.thyformer_logging import MetricLogger
 
 
+def amp_settings(cfg: ThyFormerConfig):
+    """Returns (enabled, dtype) for autocast based on config.
+
+    bf16 is range-safe (no loss scaling); fp16 needs a GradScaler.
+    """
+    enabled = cfg.training.fp16
+    dtype = (
+        torch.bfloat16 if getattr(cfg.training, "amp_dtype", "fp16") == "bf16" else torch.float16
+    )
+    return enabled, dtype
+
+
 def build_optimizer(model: ThyFormer, cfg: ThyFormerConfig) -> AdamW:
     groups = model.get_param_groups()
     return AdamW(
@@ -133,8 +145,11 @@ def train_one_epoch(
 ):
     model.train()
     device = next(model.parameters()).device
+    amp_enabled, amp_dtype = amp_settings(cfg)
     warmup_steps = cfg.training.warmup_epochs * len(loader)
     total_loss = 0.0
+    n_batches = 0
+    n_nonfinite = 0
     all_logits, all_labels = [], []
 
     for step, batch in enumerate(loader):
@@ -146,10 +161,16 @@ def train_one_epoch(
         bnds = batch["boundary"].to(device, non_blocking=True)
 
         opt.zero_grad()
-        with autocast(device_type="cuda", enabled=cfg.training.fp16):
+        with autocast(device_type="cuda", dtype=amp_dtype, enabled=amp_enabled):
             preds = model(imgs)
             losses = loss_fn(preds, {"label": lbs, "mask": msks, "boundary": bnds}, epoch=epoch)
             loss = losses["loss_total"]
+
+        # Skip non-finite batches so one bad step can't corrupt the weights.
+        if not torch.isfinite(loss):
+            n_nonfinite += 1
+            global_step += 1
+            continue
 
         scaler.scale(loss).backward()
         scaler.unscale_(opt)
@@ -161,7 +182,8 @@ def train_one_epoch(
             scheduler.step()
 
         total_loss += loss.item()
-        all_logits.append(preds["cls_logits"].detach().cpu())
+        n_batches += 1
+        all_logits.append(preds["cls_logits"].detach().float().cpu())
         hard = lbs.argmax(1) if lbs.dim() == 2 else lbs
         all_labels.append(hard.cpu())
 
@@ -169,10 +191,13 @@ def train_one_epoch(
             logger.log_step(epoch, step, len(loader), losses, opt.param_groups[0]["lr"])
         global_step += 1
 
+    if n_nonfinite:
+        print(f"  ⚠ skipped {n_nonfinite} non-finite loss batch(es) this epoch")
+
     logits = torch.cat(all_logits)
     labels = torch.cat(all_labels)
     m = compute_metrics(logits, labels, prefix="train")
-    m["train_loss"] = total_loss / len(loader)
+    m["train_loss"] = total_loss / max(n_batches, 1)
     return m, global_step
 
 
@@ -188,12 +213,12 @@ def evaluate(model, loader, loss_fn, epoch, prefix="val", cfg=None):
         lbs = batch["label"].to(device, non_blocking=True)
         msks = batch["mask"].to(device, non_blocking=True)
         bnds = batch["boundary"].to(device, non_blocking=True)
-        fp16 = cfg.training.fp16 if cfg else False
-        with autocast(device_type="cuda", enabled=fp16):
+        amp_enabled, amp_dtype = amp_settings(cfg) if cfg else (False, torch.float16)
+        with autocast(device_type="cuda", dtype=amp_dtype, enabled=amp_enabled):
             preds = model(imgs)
             losses = loss_fn(preds, {"label": lbs, "mask": msks, "boundary": bnds}, epoch=epoch)
         total_loss += losses["loss_total"].item()
-        all_logits.append(preds["cls_logits"].cpu())
+        all_logits.append(preds["cls_logits"].float().cpu())
         hard = lbs.argmax(1) if lbs.dim() == 2 else lbs
         all_labels.append(hard.cpu())
 
@@ -215,7 +240,9 @@ def train(
     model = model.to(device)
     opt = build_optimizer(model, cfg)
     sched = build_scheduler(opt, cfg, len(dataloaders["train"]))
-    scaler = GradScaler(enabled=cfg.training.fp16)
+    # GradScaler is only needed for fp16 (bf16 has fp32 range; scaling is a no-op/harmful).
+    _, amp_dtype = amp_settings(cfg)
+    scaler = GradScaler(enabled=cfg.training.fp16 and amp_dtype == torch.float16)
     stopper = EarlyStopping(cfg.training.early_stopping_patience, cfg.training.early_stopping_mode)
     ckpt_mgr = CheckpointManager(cfg.training.checkpoint_dir, cfg.training.save_top_k)
     logger = MetricLogger(

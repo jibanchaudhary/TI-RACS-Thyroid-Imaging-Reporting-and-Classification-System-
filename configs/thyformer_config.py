@@ -70,7 +70,11 @@ class TrainingConfig:
     batch_size: int = 4  # 720x720 has ~10x the tokens of 224; 8GB GPU limit
     num_workers: int = 4
     pin_memory: bool = True
-    fp16: bool = True
+    fp16: bool = True  # master switch for mixed-precision (AMP)
+    # AMP dtype: "bf16" has the same exponent range as fp32 (overflow-safe, no
+    # loss scaling needed) — recommended at 720px. "fp16" overflows at >65504
+    # and was causing the loss → inf → nan divergence around epoch 3.
+    amp_dtype: str = "bf16"
     gradient_clip_val: float = 1.0
     optimizer: str = "adamw"
     lr_backbone: float = 1e-4
@@ -85,7 +89,7 @@ class TrainingConfig:
     early_stopping_mode: str = "min"
     checkpoint_dir: str = "artifacts/thyformer_v2_720/checkpoints"
     save_top_k: int = 3
-    log_dir: str = "logs"
+    log_dir: str = "artifacts/thyformer_v2_720/logs"
     log_interval: int = 10
     use_wandb: bool = False
     project_name: str = "thyformer"

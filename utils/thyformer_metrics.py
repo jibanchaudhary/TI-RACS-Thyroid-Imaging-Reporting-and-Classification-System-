@@ -19,6 +19,10 @@ from sklearn.metrics import accuracy_score, cohen_kappa_score, f1_score, roc_auc
 def compute_metrics(
     logits: torch.Tensor, labels: torch.Tensor, prefix: str = "val", num_classes: int = 4
 ) -> Dict[str, float]:
+    # Cast to float32 first: under FP16 autocast cls_logits are float16, and a
+    # float16 softmax row sums to ~1.0003, which trips sklearn's multi_class="ovr"
+    # "scores must be probabilities" check (tol ~1e-5) and silently zeroed the AUC.
+    logits = logits.float()
     probs = F.softmax(logits, dim=-1).numpy()
     preds = logits.argmax(dim=-1).numpy()
     y = labels.numpy()
