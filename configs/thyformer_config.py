@@ -89,7 +89,7 @@ class TrainingConfig:
     early_stopping_mode: str = "min"
     checkpoint_dir: str = "artifacts/thyformer_v2_720/checkpoints"
     save_top_k: int = 3
-    log_dir: str = "artifacts/thyformer_v2_720/logs"
+    log_dir: str = "logs"
     log_interval: int = 10
     use_wandb: bool = False
     project_name: str = "thyformer"
