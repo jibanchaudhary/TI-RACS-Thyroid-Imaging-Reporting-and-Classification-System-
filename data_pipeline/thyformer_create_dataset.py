@@ -21,7 +21,7 @@ TIRADS_MAP = {
     "TR-2": 1,
     "TR-3": 2,
     "TR-4": 3,
-    "TR-5": 3,
+    "TR-5": 4,
 }
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
@@ -210,7 +210,7 @@ def mixup_collate(batch: List[Dict], alpha: float = 0.2, p: float = 0.3, num_cla
 def build_weighted_sampler(ds: ThyroidDataset) -> WeightedRandomSampler:
     labels = ds.df["label"].values
     numeric_labels = np.array([TIRADS_MAP[label] for label in labels])
-    counts = np.bincount(numeric_labels, minlength=4)
+    counts = np.bincount(numeric_labels, minlength=5)
     weights = 1.0 / np.maximum(counts, 1)
     s_weights = torch.from_numpy(weights[numeric_labels]).float()
     return WeightedRandomSampler(s_weights, len(s_weights), replacement=True)
