@@ -26,7 +26,7 @@ import matplotlib
 
 matplotlib.use("Agg")  # headless / no display needed
 
-CLASS_NAMES = ["t1", "t2", "t3", "t4"]
+CLASS_NAMES = ["t1", "t2", "t3", "t4", "t5"]
 
 
 def load_metrics(csv_path: str) -> pd.DataFrame:
@@ -98,7 +98,7 @@ def main():
     ap = argparse.ArgumentParser(description="Plot ThyFormer training curves")
     ap.add_argument("--csv", default="logs/metrics.csv", help="Path to metrics.csv")
     ap.add_argument(
-        "--out", default="artifacts/thyformer_v2_720/training_curves.png", help="Output PNG path"
+        "--out", default="artifacts/v2_thyformer_v2_720/training_curves.png", help="Output PNG path"
     )
     args = ap.parse_args()
     out = plot_metrics(args.csv, args.out)

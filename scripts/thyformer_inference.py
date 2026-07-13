@@ -58,6 +58,12 @@ TIRADS = {
     3: {"name": "T4", "desc": "Moderately suspicious", "action": "FNA if ≥1.5 cm"},
 }
 
+CLASS_NAMES = [TIRADS[i]["name"] for i in range(len(TIRADS))]
+
+# Ground-truth label → class index. Must match TIRADS_MAP in
+# data_pipeline/thyformer_create_dataset.py (TR-5 collapses into T4).
+LABEL_TO_IDX = {"TR-1": 0, "TR-2": 1, "TR-3": 2, "TR-4": 3, "TR-5": 3}
+
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
@@ -131,21 +137,6 @@ def predict_single(
     fp16: bool = True,
     image_size: int = 720,
 ) -> Dict:
-    """
-    Run inference on one image.
-
-    Returns dict:
-        image_path     : str
-        pred_class     : int   (0–3)
-        pred_label     : str   ("T1"–"T4")
-        pred_desc      : str   clinical description
-        pred_action    : str   ACR TI-RADS recommended action
-        confidence     : float (0–1)  softmax score for predicted class
-        scores         : list  [T1_score, T2_score, T3_score, T4_score]
-        echo_weights   : list  [hypo, iso, hyper] ECA activations
-        seg_mask       : np.ndarray [H, W] binary mask (sigmoid > 0.5)
-        inference_ms   : float
-    """
     tensor = preprocess_image(image_path, image_size).to(device)
 
     t0 = time.perf_counter()
@@ -182,6 +173,68 @@ def predict_single(
     }
 
 
+@torch.no_grad()
+def predict_batches(
+    model: ThyFormer,
+    image_paths: List[str],
+    device: str = "cuda",
+    fp16: bool = True,
+    image_size: int = 720,
+    batch_size: int = 6,
+) -> List[Dict]:  # was Dict — it returns a list
+    results = []
+    total = len(image_paths)
+    for start in range(0, total, batch_size):
+        chunk = image_paths[start : start + batch_size]
+
+        done = min(start + batch_size, total)
+        print(f"  inferring {done:>5d}/{total} " f"({done / total:5.1%}) …", end="\r", flush=True)
+
+        batch = torch.cat([preprocess_image(p, image_size) for p in chunk], dim=0).to(device)
+
+        t0 = time.perf_counter()
+        with autocast(device_type=device, enabled=fp16):
+            out = model(batch)
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        per_image_ms = elapsed_ms / max(len(chunk), 1)
+
+        probs = F.softmax(out["cls_logits"], dim=-1).cpu().numpy()  # [B,4]  (dropped [0])
+        pred_classes = probs.argmax(axis=1)  # [B]
+        seg_masks = (torch.sigmoid(out["seg_logits"])[:, 0].cpu().numpy() > 0.5).astype(
+            np.uint8
+        )  # [B,H,W]
+        echo_w = out["echo_weights"].cpu().numpy()  # [B,3]  (dropped [0])
+
+        for i, image_path in enumerate(chunk):  # was image_paths
+            pred_class = int(pred_classes[i])
+            results.append(
+                {
+                    "image_path": image_path,
+                    "pred_class": pred_class,
+                    "pred_label": TIRADS[pred_class]["name"],
+                    "pred_desc": TIRADS[pred_class]["desc"],
+                    "pred_action": TIRADS[pred_class]["action"],
+                    "confidence": float(probs[i][pred_class]),
+                    "scores": {
+                        "T1": float(probs[i][0]),
+                        "T2": float(probs[i][1]),
+                        "T3": float(probs[i][2]),
+                        "T4": float(probs[i][3]),
+                    },
+                    "echo_weights": {
+                        "hypoechoic": float(echo_w[i][0]),
+                        "isoechoic": float(echo_w[i][1]),
+                        "hyperechoic": float(echo_w[i][2]),
+                    },
+                    "seg_mask": seg_masks[i],
+                    "inference_ms": round(per_image_ms, 2),
+                }
+            )
+
+    print()  # finish the \r progress line
+    return results
+
+
 def collect_image_paths(
     input_dir: Optional[str] = None,
     csv_path: Optional[str] = None,
@@ -216,6 +269,7 @@ def run_batch(
     save_masks: bool = False,
     gradcam: bool = False,
     image_size: int = 720,
+    batch_size: int = 6,  # NEW — passed through to predict_batches
 ) -> List[Dict]:
     """
     Run inference on a list of images.
@@ -240,25 +294,25 @@ def run_batch(
     total = len(image_paths)
 
     print(f"\nRunning inference on {total} image(s) …")
-    print(f"  Device: {device}  |  FP16: {fp16}  |  " f"GradCAM: {gradcam}  |  Masks: {save_masks}")
+    print(
+        f"  Device: {device}  |  FP16: {fp16}  |  "
+        f"GradCAM: {gradcam}  |  Masks: {save_masks}  |  Batch: {batch_size}"
+    )
     print("─" * 55)
 
-    for i, path in enumerate(image_paths):
-        stem = Path(path).stem
+    # ── Single (chunked) batched inference pass ───────────────────
+    batch_results = predict_batches(model, image_paths, device, fp16, image_size, batch_size)
 
-        try:
-            result = predict_single(model, path, device, fp16, image_size)
-        except Exception as e:
-            print(f"  [{i+1}/{total}] ERROR {Path(path).name}: {e}")
-            results.append({"image_path": path, "error": str(e)})
-            continue
+    # ── Per-image post-processing (saving / printing only) ────────
+    for i, (path, result) in enumerate(zip(image_paths, batch_results)):
+        stem = Path(path).stem
 
         # ── Save segmentation mask ────────────────────────────────
         if save_masks:
             mask_img = (result["seg_mask"] * 255).astype(np.uint8)
             cv2.imwrite(str(mask_dir / f"{stem}_mask.png"), mask_img)
 
-        # ── Save GradCAM 3-panel ──────────────────────────────────
+        # ── Save GradCAM 3-panel (own per-image forward pass) ─────
         if gradcam:
             tensor = preprocess_image(path, image_size).to(device)
             heatmap = gcam_engine.generate(tensor, result["pred_class"])
@@ -399,6 +453,104 @@ def _save_gradcam_panel(orig: np.ndarray, heatmap: np.ndarray, result: Dict, sav
     plt.close()
 
 
+def build_gt_map(csv_path: str, image_root: Optional[str] = None) -> Dict[str, int]:
+    """Map resolved image path → ground-truth class index from a labelled CSV.
+
+    Returns an empty dict if the CSV has no usable ``label`` column. Path
+    resolution mirrors ``collect_image_paths`` so keys line up with the
+    ``image_path`` stored in each result.
+    """
+    import pandas as pd
+
+    df = pd.read_csv(csv_path)
+    if "label" not in df.columns:
+        return {}
+
+    path_col = "image_path" if "image_path" in df.columns else "img_path"
+    gt_map: Dict[str, int] = {}
+    for _, row in df.iterrows():
+        label = str(row["label"]).strip()
+        if label not in LABEL_TO_IDX:
+            continue
+        path = str(row[path_col])
+        if image_root:
+            path = str(Path(image_root) / path)
+        gt_map[path] = LABEL_TO_IDX[label]
+    return gt_map
+
+
+def save_confusion_matrix(results: List[Dict], gt_map: Dict[str, int], output_dir: str):
+    """Build a confusion matrix from predictions vs ground truth and save it.
+
+    Writes ``confusion_matrix.png`` and ``confusion_matrix.csv`` to
+    ``output_dir``. Skips silently (with a message) if no predictions could be
+    matched to a ground-truth label.
+    """
+    from sklearn.metrics import accuracy_score, confusion_matrix
+
+    y_true, y_pred = [], []
+    for r in results:
+        if "error" in r:
+            continue
+        gt = gt_map.get(r["image_path"])
+        if gt is None:
+            continue
+        y_true.append(gt)
+        y_pred.append(r["pred_class"])
+
+    if not y_true:
+        print("\nNo ground-truth labels matched predictions — confusion matrix skipped.")
+        return
+
+    n = len(CLASS_NAMES)
+    cm = confusion_matrix(y_true, y_pred, labels=list(range(n)))
+    acc = accuracy_score(y_true, y_pred)
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── CSV (true rows × predicted cols) ──────────────────────────
+    cm_csv = out_dir / "confusion_matrix.csv"
+    with open(cm_csv, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["true\\pred", *CLASS_NAMES])
+        for i, name in enumerate(CLASS_NAMES):
+            writer.writerow([name, *cm[i].tolist()])
+
+    # ── PNG ───────────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(6, 5))
+    im = ax.imshow(cm, interpolation="nearest", cmap=plt.cm.Blues)
+    fig.colorbar(im)
+    ax.set(
+        xticks=range(n),
+        yticks=range(n),
+        xticklabels=CLASS_NAMES,
+        yticklabels=CLASS_NAMES,
+        ylabel="True label",
+        xlabel="Predicted label",
+        title=f"ThyFormer — Confusion Matrix (acc {acc:.3f}, n={len(y_true)})",
+    )
+    plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
+    thresh = cm.max() / 2 if cm.max() > 0 else 0.5
+    for i in range(n):
+        for j in range(n):
+            ax.text(
+                j,
+                i,
+                str(cm[i, j]),
+                ha="center",
+                va="center",
+                color="white" if cm[i, j] > thresh else "black",
+            )
+    fig.tight_layout()
+    cm_png = out_dir / "confusion_matrix.png"
+    fig.savefig(cm_png, dpi=150)
+    plt.close(fig)
+
+    print(f"\nConfusion matrix saved → {cm_png}")
+    print(f"  (accuracy {acc:.4f} over {len(y_true)} labelled images)")
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="ThyFormer inference — TI-RADS T1–T4 classification")
     p.add_argument("--checkpoint", required=True, help="Path to .pt checkpoint file")
@@ -467,7 +619,7 @@ def main():
                 print(f"GradCAM saved → {gcam_path}")
                 gcam.remove()
     else:
-        run_batch(
+        results = run_batch(
             model=model,
             image_paths=paths,
             output_dir=args.output_dir,
@@ -477,6 +629,14 @@ def main():
             gradcam=args.gradcam,
             image_size=args.image_size,
         )
+
+        # Confusion matrix — only possible when the CSV carries ground-truth labels
+        if args.csv:
+            gt_map = build_gt_map(args.csv, args.image_root)
+            if gt_map:
+                save_confusion_matrix(results, gt_map, args.output_dir)
+            else:
+                print("\nCSV has no 'label' column — confusion matrix skipped.")
 
 
 def _print_single_result(r: Dict):

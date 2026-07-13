@@ -31,7 +31,7 @@ class SoftCrossEntropyLoss(nn.Module):
 
     def __init__(
         self,
-        num_classes: int = 4,
+        num_classes: int = 5,
         label_smoothing: float = 0.1,
         class_weights: Optional[torch.Tensor] = None,
     ):
@@ -134,12 +134,12 @@ class ThyFormerLoss(nn.Module):
 
     Args:
         cfg:           LossConfig
-        num_classes:   4 (T1–T4)
-        class_weights: [4] tensor for imbalance correction
+        num_classes:   5 (T1–T5)
+        class_weights: [5] tensor for imbalance correction
     """
 
     def __init__(
-        self, cfg: LossConfig, num_classes: int = 4, class_weights: Optional[torch.Tensor] = None
+        self, cfg: LossConfig, num_classes: int = 5, class_weights: Optional[torch.Tensor] = None
     ):
         super().__init__()
         self.alpha = cfg.alpha
@@ -184,6 +184,6 @@ class ThyFormerLoss(nn.Module):
 
 
 def build_loss(
-    cfg: LossConfig, num_classes: int = 4, class_weights: Optional[torch.Tensor] = None
+    cfg: LossConfig, num_classes: int = 5, class_weights: Optional[torch.Tensor] = None
 ) -> ThyFormerLoss:
     return ThyFormerLoss(cfg, num_classes, class_weights)

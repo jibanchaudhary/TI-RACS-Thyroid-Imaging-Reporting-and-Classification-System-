@@ -11,12 +11,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tqdm import tqdm
 
 from models.thyformer_models import ThyFormer
 
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406])
 IMAGENET_STD = np.array([0.229, 0.224, 0.225])
-TIRADS = {0: "T1", 1: "T2", 2: "T3", 3: "T4"}
+TIRADS = {0: "T1", 1: "T2", 2: "T3", 3: "T4", 4: "T5"}
 
 
 class GradCAM:
@@ -188,6 +189,7 @@ def run_gradcam_batch(model: ThyFormer, loader, out_dir: str, n: int = 50, devic
     model.to(device).eval()
     gcam = GradCAM(model)
     saved = 0
+    pbar = tqdm(total=n, desc="GradCAM", unit="img")
 
     for batch in loader:
         if saved >= n:
@@ -209,6 +211,8 @@ def run_gradcam_batch(model: ThyFormer, loader, out_dir: str, n: int = 50, devic
             orig = denorm(images[i])
             save_figure(orig, heat, pred, true_l, stems[i], out_dir, float(probs[pred]))
             saved += 1
+            pbar.update(1)
 
+    pbar.close()
     gcam.remove()
     print(f"Saved {saved} GradCAM figures → {out_dir}")

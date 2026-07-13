@@ -211,7 +211,7 @@ class ThyFormer(nn.Module):
 
         # Stage 4a
         self.cls_head = ClassificationHead(
-            self.SWIN_T_CH[-1], num_classes=4, dropout=cfg.cls_dropout
+            self.SWIN_T_CH[-1], num_classes=5, dropout=cfg.cls_dropout
         )
 
         # Stage 4b
@@ -273,4 +273,73 @@ def build_model(cfg: ModelConfig) -> ThyFormer:
     total = sum(p.numel() for p in model.parameters())
     train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"ThyFormer  total={total/1e6:.1f}M  trainable={train/1e6:.1f}M")
+    return model
+
+
+class TimmClassifier(nn.Module):
+    """
+    Thin wrapper around a plain timm classification backbone (EfficientNet,
+    ResNet, ConvNeXt, ViT, …) that exposes the same output contract as
+    ThyFormer — a dict with a `cls_logits` key — so it can be dropped into the
+    evaluation pipeline as a baseline for the DeLong test.
+
+    No segmentation / echogenicity heads: a baseline only needs class scores.
+    """
+
+    def __init__(
+        self,
+        backbone: str,
+        num_classes: int = 5,
+        pretrained: bool = False,
+        img_size: int = None,
+    ):
+        super().__init__()
+        kwargs = dict(pretrained=pretrained, num_classes=num_classes)
+        # Transformer backbones (ViT/Swin) need img_size baked in at build time;
+        # CNNs are resolution-agnostic and reject the kwarg, so only pass it when
+        # the factory accepts it.
+        if img_size is not None:
+            try:
+                self.net = timm.create_model(backbone, img_size=img_size, **kwargs)
+            except TypeError:
+                self.net = timm.create_model(backbone, **kwargs)
+        else:
+            self.net = timm.create_model(backbone, **kwargs)
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        return {"cls_logits": self.net(x)}
+
+    def load_compatible(self, state_dict: Dict[str, torch.Tensor], strict: bool = True):
+        """
+        Load weights saved either from this wrapper (keys prefixed ``net.``) or
+        from a bare timm model (no prefix, e.g. a separately trained baseline).
+        """
+        if any(k.startswith("net.") for k in state_dict):
+            return self.load_state_dict(state_dict, strict=strict)
+        return self.net.load_state_dict(state_dict, strict=strict)
+
+
+def build_baseline_model(arch: str, cfg: ModelConfig, num_classes: int = 5) -> nn.Module:
+    """
+    Build a baseline model for head-to-head comparison (e.g. DeLong's test).
+
+        arch == "thyformer" / "same"  → a full ThyFormer (same architecture)
+        any other timm model name      → that backbone wrapped in TimmClassifier
+                                          (e.g. "efficientnet_b0", "resnet50",
+                                          "convnext_tiny")
+
+    The returned module always emits a `cls_logits` tensor of shape
+    [B, num_classes], matching ThyFormer's classification output.
+    """
+    if arch.lower() in ("thyformer", "same"):
+        return ThyFormer(cfg)
+
+    model = TimmClassifier(
+        arch,
+        num_classes=num_classes,
+        pretrained=False,
+        img_size=cfg.img_size,
+    )
+    n = sum(p.numel() for p in model.parameters())
+    print(f"Baseline [{arch}]  params={n/1e6:.1f}M")
     return model

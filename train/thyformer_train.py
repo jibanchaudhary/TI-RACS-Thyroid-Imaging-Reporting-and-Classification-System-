@@ -250,6 +250,7 @@ def train(
         cfg.training.use_wandb,
         cfg.training.project_name,
         cfg.training.experiment_name,
+        resume=bool(resume_from),
     )
     best_metrics = {}
     global_step = 0
