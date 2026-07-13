@@ -15,8 +15,8 @@ class DataConfig:
     medsam_masks_dir: str = "/home/jiban/Documents/TI-RACS/stanford_dataset/med_sam"
     image_size: int = 720
     in_channels: int = 3
-    num_classes: int = 4
-    class_names: List[str] = field(default_factory=lambda: ["T1", "T2", "T3", "T4"])
+    num_classes: int = 5
+    class_names: List[str] = field(default_factory=lambda: ["T1", "T2", "T3", "T4", "T5"])
     random_seed: int = 42
 
 
@@ -59,15 +59,15 @@ class LossConfig:
     alpha: float = 1.0  # CE weight
     beta: float = 0.5  # Dice weight
     gamma: float = 0.3  # Boundary weight
-    boundary_warmup_epochs: int = 10
+    boundary_warmup_epochs: int = 2
     label_smoothing: float = 0.1
     use_class_weights: bool = True
 
 
 @dataclass
 class TrainingConfig:
-    epochs: int = 50
-    batch_size: int = 4  # 720x720 has ~10x the tokens of 224; 8GB GPU limit
+    epochs: int = 30
+    batch_size: int = 2  # 720x720 has ~10x the tokens of 224; 8GB GPU limit
     num_workers: int = 4
     pin_memory: bool = True
     fp16: bool = True  # master switch for mixed-precision (AMP)
@@ -84,12 +84,12 @@ class TrainingConfig:
     scheduler: str = "cosine"
     warmup_epochs: int = 5
     min_lr: float = 1e-6
-    early_stopping_patience: int = 10
+    early_stopping_patience: int = 5
     early_stopping_metric: str = "val_loss"
     early_stopping_mode: str = "min"
-    checkpoint_dir: str = "artifacts/thyformer_v2_720/checkpoints"
+    checkpoint_dir: str = "artifacts/v2_thyformer_v2_720/checkpoints"
     save_top_k: int = 3
-    log_dir: str = "logs"
+    log_dir: str = "artifacts/v2_thyformer_v2_720/logs"
     log_interval: int = 10
     use_wandb: bool = False
     project_name: str = "thyformer"
@@ -100,9 +100,12 @@ class TrainingConfig:
 @dataclass
 class EvaluationConfig:
     primary_metric: str = "val_auc"
-    gradcam_output_dir: str = "artifacts/outputs/gradcam"
+    # Root folder for evaluation runs. thyformer_evaluate.py writes a
+    # timestamped subfolder here with metrics, figures (ROC/PR/confusion
+    # matrix/per-class bars), per-sample predictions, GradCAM heatmaps,
+    # DeLong/kappa results, and the full run configuration.
+    output_dir: str = "artifacts/v2_thyformer_v2_720/evaluation"
     num_gradcam_samples: int = 50
-    kappa_output_dir: str = "artifacts/outputs/clinical"
 
 
 @dataclass

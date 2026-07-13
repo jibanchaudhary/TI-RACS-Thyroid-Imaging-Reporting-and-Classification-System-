@@ -2,6 +2,7 @@ import os
 import glob
 
 import cv2
+import json
 import numpy as np
 from typing import List
 import torch
@@ -11,10 +12,8 @@ from torch.utils.data import Dataset, WeightedRandomSampler
 from data_pipeline.dataset_conversion import (
     build_train_transforms,
     build_val_transforms,
-    parse_xml_case,
     polygon_to_mask,
     crop_nodule,
-    export_dataset_to_json,
 )
 
 
@@ -62,7 +61,6 @@ class ThyroidDataset(Dataset):
         self.crop = crop_nodule
         self.padding = padding
         self.img_size = BACKBONE_SIZE[backbone]
-
         if split == "train":
             self.transform = build_train_transforms(self.img_size)
         elif split == "val":
@@ -80,35 +78,84 @@ class ThyroidDataset(Dataset):
         self._print_class_dist()
 
     def _load_all_cases(self) -> List[dict]:
-        ann_dir = os.path.join(self.data_dir, "annotations")
+        ann_dir = os.path.join(self.data_dir, "jsons")
         img_dir = os.path.join(self.data_dir, "images")
 
-        xml_files = sorted(glob.glob(os.path.join(ann_dir, "*.xml")))
-        if not xml_files:
-            raise FileNotFoundError(f"No xml files found in the {ann_dir}")
+        json_files = sorted(glob.glob(os.path.join(ann_dir, "*.json")))
+
+        if not json_files:
+            raise FileNotFoundError(f"No json files found in {ann_dir}")
 
         cases = []
-        for xml_path in xml_files:
-            case = parse_xml_case(xml_path)
-            if case is None:
-                continue
 
-            img_id = case["case_id"]
-            img_path = None
-            for ext in (".jpg", ".jpeg", ".png"):
-                img_matches = glob.glob(os.path.join(img_dir, f"{img_id}_*{ext}"))
-                img_path = img_matches[0]
-                break
+        for json_path in json_files:
+            with open(json_path, "r") as f:
+                content = json.load(f)
 
-            if img_path is None:
-                continue
+            label = TIRADS_MAP[str(content["tirads_raw"])]
+            content["label"] = label
 
-            case["img_path"] = img_path
+            img_path = os.path.join(img_dir, f'{content["frame_id"]}.jpg')
+            content["img_path"] = img_path
+            cases.append(content)
 
-            cases.append(case)
         if not cases:
             raise RuntimeError("No valid cases found. Check data_dir layout.")
+
         return cases
+        # cases = []
+        # for xml_path in xml_files:
+        #     case = parse_xml_case(xml_path)
+        #     if case is None:
+        #         continue
+
+        #     img_id = case["case_id"]
+        #     img_path = None
+        #     for ext in (".jpg", ".jpeg", ".png"):
+        #         img_matches = glob.glob(os.path.join(img_dir, f"{img_id}_*{ext}"))
+        #         img_path = img_matches[0]
+        #         break
+
+        #     if img_path is None:
+        #         continue
+        #     breakpoint()
+        #     case["img_path"] = img_path
+        #     breakpoint()
+        #     cases.append(case)
+        # if not cases:
+        #     raise RuntimeError("No valid cases found. Check data_dir layout.")
+        # return cases
+
+    # def _load_all_cases(self) -> List[dict]:
+    #     ann_dir = os.path.join(self.data_dir, "annotations")
+    #     img_dir = os.path.join(self.data_dir, "images")
+
+    #     xml_files = sorted(glob.glob(os.path.join(ann_dir, "*.xml")))
+    #     if not xml_files:
+    #         raise FileNotFoundError(f"No xml files found in the {ann_dir}")
+
+    #     cases = []
+    #     for xml_path in xml_files:
+    #         case = parse_xml_case(xml_path)
+    #         if case is None:
+    #             continue
+
+    #         img_id = case["case_id"]
+    #         img_path = None
+    #         for ext in (".jpg", ".jpeg", ".png"):
+    #             img_matches = glob.glob(os.path.join(img_dir, f"{img_id}_*{ext}"))
+    #             img_path = img_matches[0]
+    #             break
+
+    #         if img_path is None:
+    #             continue
+
+    #         case["img_path"] = img_path
+
+    #         cases.append(case)
+    #     if not cases:
+    #         raise RuntimeError("No valid cases found. Check data_dir layout.")
+    #     return cases
 
     @staticmethod
     def _split(cases, train_r, val_r, seed, which):
@@ -193,16 +240,16 @@ if __name__ == "__main__":
         crop_nodule=True,
         padding=24,
     )
-    export_dataset_to_json(
-        train_dataset, output_dir="/home/jiban/Documents/TI-RACS/artifacts/test_v1/json_dataset"
-    )
+    # export_dataset_to_json(
+    #     train_dataset, output_dir="/home/jiban/Documents/TI-RACS/artifacts/test_v1/json_dataset"
+    # )
 
-    export_dataset_to_json(
-        val_dataset, output_dir="/home/jiban/Documents/TI-RACS/artifacts/test_v1/json_dataset"
-    )
+    # export_dataset_to_json(
+    #     val_dataset, output_dir="/home/jiban/Documents/TI-RACS/artifacts/test_v1/json_dataset"
+    # )
 
-    export_dataset_to_json(
-        test_dataset, output_dir="/home/jiban/Documents/TI-RACS/artifacts/test_v1/json_dataset"
-    )
+    # export_dataset_to_json(
+    #     test_dataset, output_dir="/home/jiban/Documents/TI-RACS/artifacts/test_v1/json_dataset"
+    # )
     # print("\nFirst case:")
     # print(dataset.cases[0])
