@@ -23,7 +23,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import timm
-from data_pipeline.create_dataset import NUM_CLASSES
+from data_pipeline.create_dataset import NUM_CLASSES, BACKBONE_SIZE
 
 FEATURE_DIM = {"convnext": 768, "efficientnet": 1280, "swin": 768, "vit": 768}
 
@@ -65,10 +65,24 @@ class BackboneModel(nn.Module):
 
         feat_dim = FEATURE_DIM[backbone_name]
 
+        # """Loading backbone"""
+        # self.backbone = timm.create_model(
+        #     self.TIMM_NAMES[backbone_name], pretrained=pretrained, num_classes=0, global_pool="avg"
+        # )
         """Loading backbone"""
-        self.backbone = timm.create_model(
-            self.TIMM_NAMES[backbone_name], pretrained=pretrained, num_classes=0, global_pool="avg"
-        )
+        img_size = BACKBONE_SIZE[backbone_name]
+        base_kwargs = dict(pretrained=pretrained, num_classes=0, global_pool="avg")
+        try:
+            # ViT/Swin bake the input resolution in at build time — pass img_size so
+            # 720px input matches; timm interpolates the pretrained 224 position
+            # embeddings (ViT) / rebuilds the window tables (Swin) automatically.
+            self.backbone = timm.create_model(
+                self.TIMM_NAMES[backbone_name], img_size=img_size, **base_kwargs
+            )
+        except TypeError:
+            # ConvNeXt / EfficientNet are conv nets: resolution-agnostic, and they
+            # reject the img_size kwarg — build them without it.
+            self.backbone = timm.create_model(self.TIMM_NAMES[backbone_name], **base_kwargs)
 
         self.head = nn.Sequential(
             nn.Dropout(p=0.3),

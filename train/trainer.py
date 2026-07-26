@@ -13,6 +13,8 @@
 #   - Per-epoch checkpoint saving (best + last)
 #   - Resume interrupted training (--resume auto | --resume <ckpt path>)
 #   - CSV metrics log
+#   - Plain-text train.log per run (timestamped console output + every
+#     per-epoch metric incl. per-class AUC/F1)
 #   - Saved metric plots (training curves, confusion matrix, ROC/PR curves,
 #     per-class precision/recall/F1) under <output_dir>/<backbone>/plots/
 #   - Grad-CAM hook registration (used by inference.py)
@@ -149,6 +151,79 @@ def compute_epoch_metrics(all_labels, all_preds, all_probs) -> dict:
     return m
 
 
+def plot_training_curves(log_path: str, plots_dir: str, name: str):
+    """
+    Render the 3x3 training-curves grid (loss/acc/macro metrics + per-class
+    AUC val, per-class F1 val, per-class AUC train) from a metrics.csv.
+    Callable standalone (--plot_only) so plots can be regenerated for a
+    finished or interrupted run without retraining.
+    """
+    with open(log_path) as f:
+        history = list(csv.DictReader(f))
+    if not history:
+        return
+
+    def col(colname):
+        return np.array([float(r.get(colname) or "nan") for r in history])
+
+    missing = [k for k in (f"val_auc_{c}" for c in CLASS_NAMES) if k not in history[0]]
+    if missing:
+        print(
+            f"  Note: {log_path} has no per-class columns "
+            "(logged by an older trainer); per-class panels will be empty. "
+            "Retrain to record them."
+        )
+
+    epochs = col("epoch")
+    fig, axes = plt.subplots(3, 3, figsize=(16, 12), facecolor=PLOT_SURFACE)
+
+    pair_panels = (
+        (axes[0][0], "Loss", "train_loss", "val_loss"),
+        (axes[0][1], "Accuracy", "train_acc", "val_acc"),
+        (axes[0][2], "Macro AUC", "train_auc", "val_auc"),
+        (axes[1][0], "Macro F1", "train_f1", "val_f1"),
+        (axes[1][1], "Sensitivity (macro)", "train_sens", "val_sens"),
+        (axes[1][2], "Specificity (macro)", "train_spec", "val_spec"),
+    )
+    for ax, title, tcol, vcol in pair_panels:
+        ax.plot(epochs, col(tcol), color=PLOT_SERIES[0], lw=2, marker="o", ms=3.5, label="train")
+        ax.plot(epochs, col(vcol), color=PLOT_SERIES[1], lw=2, marker="o", ms=3.5, label="val")
+        ax.set_title(title, color=PLOT_INK, fontsize=11)
+        ax.legend(frameon=False, fontsize=9, labelcolor=PLOT_INK_2)
+
+    class_panels = (
+        (axes[2][0], "Per-class AUC (val)", "val_auc_"),
+        (axes[2][1], "Per-class F1 (val)", "val_f1_"),
+        (axes[2][2], "Per-class AUC (train)", "train_auc_"),
+    )
+    for ax, title, prefix in class_panels:
+        for i, c in enumerate(CLASS_NAMES):
+            ax.plot(
+                epochs,
+                col(f"{prefix}{c}"),
+                color=PLOT_SERIES[i % len(PLOT_SERIES)],
+                lw=2,
+                marker="o",
+                ms=3.5,
+                label=c,
+            )
+        ax.set_title(title, color=PLOT_INK, fontsize=11)
+        ax.legend(frameon=False, fontsize=8, labelcolor=PLOT_INK_2, ncols=2)
+
+    for row in axes:
+        for ax in row:
+            _style_axis(ax)
+            ax.set_xlabel("epoch", color=PLOT_INK_2, fontsize=9)
+
+    fig.suptitle(f"{name} — training metrics", color=PLOT_INK, fontsize=15, fontweight="bold")
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    os.makedirs(plots_dir, exist_ok=True)
+    out = os.path.join(plots_dir, "training_curves.png")
+    fig.savefig(out, dpi=150, facecolor=PLOT_SURFACE)
+    plt.close(fig)
+    print(f"  Saved {out}")
+
+
 class LabelSmoothingCE(nn.Module):
     def __init__(self, smoothing: float = 0.1, num_classes: int = NUM_CLASSES):
         super().__init__()
@@ -254,13 +329,16 @@ class Trainer:
         self.plots_dir = os.path.join(self.output_dir, "plots")
         os.makedirs(self.plots_dir, exist_ok=True)
 
+        # Plain-text session log (append mode so resumed runs keep history)
+        self.txt_log_path = os.path.join(self.output_dir, "train.log")
+
         self.resume_path = None
         if resume:
             cand = os.path.join(self.output_dir, "last.pt") if resume == "auto" else resume
             if os.path.isfile(cand):
                 self.resume_path = cand
             elif resume == "auto":
-                print(f"No last.pt found in {self.output_dir}; starting fresh")
+                self._log(f"No last.pt found in {self.output_dir}; starting fresh")
             else:
                 raise FileNotFoundError(f"Resume checkpoint not found: {cand}")
 
@@ -271,15 +349,23 @@ class Trainer:
             if torch.backends.mps.is_available()
             else "cpu"
         )
-        print(f"\n{'='*60}")
-        print(f" Training backbone : {backbone}")
-        print(f" Device            : {self.device}")
-        print(f" Output dir        : {self.output_dir}")
-        print(f"{'='*60}\n")
+        self._log(f"\n{'='*60}")
+        self._log(f" Training backbone : {backbone}")
+        self._log(f" Device            : {self.device}")
+        self._log(f" Output dir        : {self.output_dir}")
+        self._log(
+            f" batch_size={batch_size} lr={lr} weight_decay={weight_decay}\n"
+            f" warmup_epochs={warmup_epochs} freeze_epochs={freeze_epochs} "
+            f"patience={patience}\n"
+            f" label_smoothing={label_smoothing} amp={self.use_amp} "
+            f"num_workers={num_workers}"
+        )
+        self._log(f"{'='*60}\n")
 
         # Datasets
         self.train_ds = ThyroidDataset(data_dir, "train", backbone)
         self.val_ds = ThyroidDataset(data_dir, "val", backbone)
+        self._log(f"Train samples: {len(self.train_ds)} | Val samples: {len(self.val_ds)}")
         sampler = self.train_ds.get_weighted_sampler()
         self.train_loader = DataLoader(
             self.train_ds,
@@ -322,6 +408,14 @@ class Trainer:
             with open(self.log_path, "w", newline="") as f:
                 csv.writer(f).writerow(self.LOG_FIELDS)
 
+    def _log(self, msg: str = ""):
+        """Print to console and append the same lines, timestamped, to train.log."""
+        print(msg)
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(self.txt_log_path, "a") as f:
+            for line in str(msg).split("\n"):
+                f.write(f"[{stamp}] {line}\n")
+
     def _train_epoch(self, epoch: int) -> tuple[float, dict]:
         self.model.train()
         self.model.on_epoch_start(epoch)
@@ -358,7 +452,10 @@ class Trainer:
             total_loss += loss.item() * labels.size(0)
 
             if (batch_idx + 1) % 10 == 0:
-                print(f"  Epoch {epoch:3d} | step {batch_idx+1:4d}" f" | loss {loss.item():.4f}")
+                self._log(
+                    f"  Epoch {epoch:3d} | step {batch_idx+1:4d}/{len(self.train_loader)}"
+                    f" | loss {loss.item():.4f}"
+                )
 
         return total_loss / total, compute_epoch_metrics(all_labels, all_preds, all_probs)
 
@@ -399,6 +496,7 @@ class Trainer:
             warmup_epochs=self.warmup_epochs,
             total_epochs=epochs,
         )
+        self._log(f"Starting fit: epochs={epochs}, early-stopping patience={self.patience}")
 
         best_val_loss = float("inf")
         patience_count = 0
@@ -419,11 +517,23 @@ class Trainer:
             current_lr = self.optimizer.param_groups[-1]["lr"]
             elapsed = time.time() - t0
 
-            print(
+            self._log(
                 f"\nEpoch {epoch:3d}/{epochs} | {elapsed:.1f}s | "
                 f"train loss {train_loss:.4f}  acc {tm['acc']:.4f} | "
                 f"val   loss {val_loss:.4f}  acc {val_acc:.4f}  "
                 f"f1 {vm['f1']:.4f}  auc {vm['auc']:.4f} | lr {current_lr:.2e}"
+            )
+
+            def per_class(values):
+                return " | ".join(f"{c} {v:.4f}" for c, v in zip(CLASS_NAMES, values))
+
+            self._log(
+                f"  train macro: f1 {tm['f1']:.4f}  auc {tm['auc']:.4f}  "
+                f"sens {tm['sens']:.4f}  spec {tm['spec']:.4f}\n"
+                f"  val   macro: sens {vm['sens']:.4f}  spec {vm['spec']:.4f}\n"
+                f"  val   AUC per class: {per_class(vm['per_auc'])}\n"
+                f"  val   F1  per class: {per_class(vm['per_f1'])}\n"
+                f"  train AUC per class: {per_class(tm['per_auc'])}"
             )
 
             # Log metrics
@@ -459,10 +569,10 @@ class Trainer:
                 self._save_checkpoint(
                     epoch, val_loss, val_acc, best_ckpt_path, best_val_loss, patience_count
                 )
-                print(f"  ✓ New best val loss: {best_val_loss:.4f}")
+                self._log(f"  ✓ New best val loss: {best_val_loss:.4f}")
             else:
                 patience_count += 1
-                print(f"  No improvement ({patience_count}/{self.patience})")
+                self._log(f"  No improvement ({patience_count}/{self.patience})")
 
             # Save last checkpoint always (after the best/patience update so a
             # resumed run continues early stopping from the right state)
@@ -476,14 +586,14 @@ class Trainer:
             )
 
             if patience_count >= self.patience:
-                print(f"\nEarly stopping at epoch {epoch}")
+                self._log(f"\nEarly stopping at epoch {epoch}")
                 break
 
-        print(f"\nTraining complete. Best checkpoint: {best_ckpt_path}")
+        self._log(f"\nTraining complete. Best checkpoint: {best_ckpt_path}")
         try:
             self._plot_training_curves()
         except Exception as e:
-            print(f"Could not plot training curves: {e}")
+            self._log(f"Could not plot training curves: {e}")
         self._final_eval(best_ckpt_path)
         return best_ckpt_path
 
@@ -553,7 +663,7 @@ class Trainer:
 
         self._trim_metrics_log(completed)
 
-        print(
+        self._log(
             f"Resumed from {self.resume_path} "
             f"(epoch {completed} done, best val loss {best_val_loss:.4f}, "
             f"patience {patience_count}/{self.patience}) -> continuing at epoch {start_epoch}"
@@ -588,11 +698,8 @@ class Trainer:
             all_labels.extend(labels.tolist())
             all_probs.extend(probs.cpu().tolist())
 
-        print("\n--- Final validation report ---")
+        self._log("\n--- Final validation report ---")
         unique_labels = sorted(set(all_labels) | set(all_preds))
-
-        # print(classification_report(all_labels, all_preds,
-        #                             target_names=CLASS_NAMES, zero_division=0))
 
         report = classification_report(
             all_labels,
@@ -601,21 +708,21 @@ class Trainer:
             target_names=[CLASS_NAMES[i] for i in unique_labels],
             zero_division=0,
         )
-        print(report)
+        self._log(report)
 
         # AUC (macro OvR)
         y_bin = label_binarize(all_labels, classes=list(range(NUM_CLASSES)))
         macro_auc = None
         try:
             macro_auc = roc_auc_score(y_bin, all_probs, multi_class="ovr", average="macro")
-            print(f"Macro AUC: {macro_auc:.4f}")
+            self._log(f"Macro AUC: {macro_auc:.4f}")
         except ValueError:
-            print("AUC: not computable (too few classes in val set)")
+            self._log("AUC: not computable (too few classes in val set)")
 
         # Confusion matrix
         cm = confusion_matrix(all_labels, all_preds, labels=unique_labels)
-        print("\nConfusion matrix:")
-        print(cm)
+        self._log("\nConfusion matrix:")
+        self._log(str(cm))
 
         self._save_eval_plots(
             all_labels, all_preds, all_probs, cm, unique_labels, report, macro_auc
@@ -626,65 +733,7 @@ class Trainer:
     # ------------------------------------------------------------------
 
     def _plot_training_curves(self):
-        with open(self.log_path) as f:
-            history = list(csv.DictReader(f))
-        if not history:
-            return
-
-        def col(name):
-            return np.array([float(r.get(name) or "nan") for r in history])
-
-        epochs = col("epoch")
-        fig, axes = plt.subplots(3, 3, figsize=(16, 12), facecolor=PLOT_SURFACE)
-
-        pair_panels = (
-            (axes[0][0], "Loss", "train_loss", "val_loss"),
-            (axes[0][1], "Accuracy", "train_acc", "val_acc"),
-            (axes[0][2], "Macro AUC", "train_auc", "val_auc"),
-            (axes[1][0], "Macro F1", "train_f1", "val_f1"),
-            (axes[1][1], "Sensitivity (macro)", "train_sens", "val_sens"),
-            (axes[1][2], "Specificity (macro)", "train_spec", "val_spec"),
-        )
-        for ax, title, tcol, vcol in pair_panels:
-            ax.plot(
-                epochs, col(tcol), color=PLOT_SERIES[0], lw=2, marker="o", ms=3.5, label="train"
-            )
-            ax.plot(epochs, col(vcol), color=PLOT_SERIES[1], lw=2, marker="o", ms=3.5, label="val")
-            ax.set_title(title, color=PLOT_INK, fontsize=11)
-            ax.legend(frameon=False, fontsize=9, labelcolor=PLOT_INK_2)
-
-        class_panels = (
-            (axes[2][0], "Per-class AUC (val)", "val_auc_"),
-            (axes[2][1], "Per-class F1 (val)", "val_f1_"),
-            (axes[2][2], "Per-class AUC (train)", "train_auc_"),
-        )
-        for ax, title, prefix in class_panels:
-            for i, c in enumerate(CLASS_NAMES):
-                ax.plot(
-                    epochs,
-                    col(f"{prefix}{c}"),
-                    color=PLOT_SERIES[i % len(PLOT_SERIES)],
-                    lw=2,
-                    marker="o",
-                    ms=3.5,
-                    label=c,
-                )
-            ax.set_title(title, color=PLOT_INK, fontsize=11)
-            ax.legend(frameon=False, fontsize=8, labelcolor=PLOT_INK_2, ncols=2)
-
-        for row in axes:
-            for ax in row:
-                _style_axis(ax)
-                ax.set_xlabel("epoch", color=PLOT_INK_2, fontsize=9)
-
-        fig.suptitle(
-            f"{self.backbone} — training metrics", color=PLOT_INK, fontsize=15, fontweight="bold"
-        )
-        fig.tight_layout(rect=(0, 0, 1, 0.97))
-        out = os.path.join(self.plots_dir, "training_curves.png")
-        fig.savefig(out, dpi=150, facecolor=PLOT_SURFACE)
-        plt.close(fig)
-        print(f"  Saved {out}")
+        plot_training_curves(self.log_path, self.plots_dir, self.backbone)
 
     def _save_eval_plots(
         self, all_labels, all_preds, all_probs, cm, unique_labels, report, macro_auc
@@ -883,14 +932,29 @@ if __name__ == "__main__":
         help="'auto' = continue each backbone from its <output_dir>/<backbone>/last.pt; "
         "or a checkpoint path (single-backbone runs only)",
     )
+    parser.add_argument(
+        "--plot_only",
+        action="store_true",
+        help="Regenerate training_curves.png from each backbone's existing "
+        "<output_dir>/<backbone>/metrics.csv without training",
+    )
     args = parser.parse_args()
 
-    backbones = (
-        ["convnext", "efficientnet", "swin", "vit"] if args.backbone == "all" else [args.backbone]
-    )
-
+    # backbones = (
+    #     ["convnext", "efficientnet", "swin", "vit"] if args.backbone == "all" else [args.backbone]
+    # )
+    backbones = ["efficientnet"] if args.backbone == "all" else [args.backbone]
     if args.resume and args.resume != "auto" and len(backbones) > 1:
         parser.error("--resume <path> only works with a single --backbone; use --resume auto")
+
+    if args.plot_only:
+        for bb in backbones:
+            log_path = os.path.join(args.output_dir, bb, "metrics.csv")
+            if not os.path.isfile(log_path):
+                print(f"Skipping {bb}: no metrics.csv at {log_path}")
+                continue
+            plot_training_curves(log_path, os.path.join(args.output_dir, bb, "plots"), bb)
+        raise SystemExit(0)
 
     for bb in backbones:
         trainer = Trainer(

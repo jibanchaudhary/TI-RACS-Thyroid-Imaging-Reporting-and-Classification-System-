@@ -10,6 +10,7 @@ ThyFormer — Evaluation Metrics
 • DeLong's test (bootstrap) for significance comparison
 • Cohen's kappa for clinical radiologist agreement
 """
+import warnings
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -73,6 +74,33 @@ def compute_calibration(
     return {"ece": float(ece), "mce": float(mce), "brier": brier}, rows
 
 
+def _ovr_auc(y: np.ndarray, probs: np.ndarray, num_classes: int) -> Tuple[List[float], float]:
+    """
+    One-vs-rest AUC per class plus the macro average, robust to classes that are
+    missing from ``y``. A class with no positives (absent from this split) or no
+    negatives has an undefined OvR AUC, so it is reported as NaN and excluded
+    from the macro mean — instead of letting sklearn emit UndefinedMetricWarning
+    or raise on a probs-column/label-count mismatch. This lets evaluation run on
+    any subset of the classes (all 5, or just 3, etc.).
+
+    The macro value here equals sklearn's roc_auc_score(multi_class="ovr",
+    average="macro") whenever every class is present, so numbers are unchanged
+    on a full test set.
+    """
+    per_class: List[float] = []
+    valid: List[float] = []
+    for c in range(num_classes):
+        y_bin = (y == c).astype(int)
+        if y_bin.min() == y_bin.max():  # class has no positives (or no negatives)
+            per_class.append(float("nan"))
+            continue
+        auc_c = float(roc_auc_score(y_bin, probs[:, c]))
+        per_class.append(auc_c)
+        valid.append(auc_c)
+    macro = float(np.mean(valid)) if valid else 0.0
+    return per_class, macro
+
+
 def _scalar_metrics(y: np.ndarray, probs: np.ndarray, num_classes: int = 5) -> Dict[str, float]:
     """
     All scalar metrics (unprefixed) from labels + probabilities. Shared by
@@ -83,18 +111,11 @@ def _scalar_metrics(y: np.ndarray, probs: np.ndarray, num_classes: int = 5) -> D
     m = {}
     cn = [f"t{i + 1}" for i in range(num_classes)]
 
-    # Macro AUC
-    try:
-        m["auc"] = float(roc_auc_score(y, probs, multi_class="ovr", average="macro"))
-    except ValueError:
-        m["auc"] = 0.0
-
-    # Per-class AUC
+    # AUC — one-vs-rest, macro-averaged over the classes actually present in this
+    # split (absent classes -> NaN, excluded from the macro). See _ovr_auc.
+    per_class_auc, m["auc"] = _ovr_auc(y, probs, num_classes)
     for c in range(num_classes):
-        try:
-            m[f"auc_{cn[c]}"] = float(roc_auc_score((y == c).astype(int), probs[:, c]))
-        except ValueError:
-            m[f"auc_{cn[c]}"] = 0.0
+        m[f"auc_{cn[c]}"] = per_class_auc[c]
 
     # Average precision (per class + macro) — the imbalance-appropriate summary
     aps = []
@@ -129,9 +150,14 @@ def _scalar_metrics(y: np.ndarray, probs: np.ndarray, num_classes: int = 5) -> D
     m["ppv"] = float(precision_score(y, preds, average="macro", zero_division=0))
     m["npv"] = float(np.mean(npvs))
 
-    # Accuracy family
+    # Accuracy family. balanced_accuracy warns "y_pred contains classes not in
+    # y_true" when the model predicts a class that is absent from this split —
+    # expected when evaluating on a subset of the classes; the value is still
+    # valid (recall averaged over the classes present in y_true).
     m["accuracy"] = float(accuracy_score(y, preds))
-    m["balanced_accuracy"] = float(balanced_accuracy_score(y, preds))
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="y_pred contains classes not in y_true")
+        m["balanced_accuracy"] = float(balanced_accuracy_score(y, preds))
     m["mcc"] = float(matthews_corrcoef(y, preds))
 
     # Ordinal grade metrics — TI-RADS grades are ordered, so T4→T3 is a far
@@ -209,18 +235,16 @@ def delong_test(
     """
     rng = np.random.default_rng(42)
     n = len(labels)
-    auc_a = roc_auc_score(labels, probs_a, multi_class="ovr", average="macro")
-    auc_b = roc_auc_score(labels, probs_b, multi_class="ovr", average="macro")
+    nc_a, nc_b = probs_a.shape[1], probs_b.shape[1]
+    _, auc_a = _ovr_auc(labels, probs_a, nc_a)
+    _, auc_b = _ovr_auc(labels, probs_b, nc_b)
 
     diffs = []
     for _ in tqdm(range(n_bootstrap), desc="DeLong bootstrap", unit="it", leave=False):
         idx = rng.integers(0, n, n)
-        try:
-            da = roc_auc_score(labels[idx], probs_a[idx], multi_class="ovr", average="macro")
-            db = roc_auc_score(labels[idx], probs_b[idx], multi_class="ovr", average="macro")
-            diffs.append(da - db)
-        except ValueError:
-            pass
+        _, da = _ovr_auc(labels[idx], probs_a[idx], nc_a)
+        _, db = _ovr_auc(labels[idx], probs_b[idx], nc_b)
+        diffs.append(da - db)
 
     se = np.std(diffs)
     z = (auc_a - auc_b) / max(se, 1e-9)

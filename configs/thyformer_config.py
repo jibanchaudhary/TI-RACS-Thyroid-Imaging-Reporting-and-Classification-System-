@@ -9,9 +9,9 @@ from typing import List, Tuple
 @dataclass
 class DataConfig:
     data_root: str = "/home/jiban/Documents/TI-RACS/stanford_dataset/images"
-    train_csv: str = "/home/jiban/Documents/TI-RACS/stanford_dataset/train.csv"
-    val_csv: str = "/home/jiban/Documents/TI-RACS/stanford_dataset/val.csv"
-    test_csv: str = "/home/jiban/Documents/TI-RACS/stanford_dataset/test.csv"
+    train_csv: str = "resplit_stanford_dataset/train.csv"
+    val_csv: str = "resplit_stanford_dataset/val.csv"
+    test_csv: str = "resplit_stanford_dataset/test.csv"
     medsam_masks_dir: str = "/home/jiban/Documents/TI-RACS/stanford_dataset/med_sam"
     image_size: int = 720
     in_channels: int = 3
@@ -68,7 +68,7 @@ class LossConfig:
 class TrainingConfig:
     epochs: int = 30
     batch_size: int = 2  # 720x720 has ~10x the tokens of 224; 8GB GPU limit
-    num_workers: int = 4
+    num_workers: int = 8
     pin_memory: bool = True
     fp16: bool = True  # master switch for mixed-precision (AMP)
     # AMP dtype: "bf16" has the same exponent range as fp32 (overflow-safe, no
@@ -82,14 +82,14 @@ class TrainingConfig:
     weight_decay: float = 1e-4
     betas: Tuple[float, float] = (0.9, 0.999)
     scheduler: str = "cosine"
-    warmup_epochs: int = 5
+    warmup_epochs: int = 3
     min_lr: float = 1e-6
     early_stopping_patience: int = 5
     early_stopping_metric: str = "val_loss"
     early_stopping_mode: str = "min"
-    checkpoint_dir: str = "artifacts/v2_thyformer_v2_720/checkpoints"
+    checkpoint_dir: str = "artifacts/v3_thyformer_720_resplit_dataset_models/checkpoints"
     save_top_k: int = 3
-    log_dir: str = "artifacts/v2_thyformer_v2_720/logs"
+    log_dir: str = "artifacts/v3_thyformer_720_resplit_dataset_models/logs"
     log_interval: int = 10
     use_wandb: bool = False
     project_name: str = "thyformer"
@@ -104,7 +104,7 @@ class EvaluationConfig:
     # timestamped subfolder here with metrics, figures (ROC/PR/confusion
     # matrix/per-class bars), per-sample predictions, GradCAM heatmaps,
     # DeLong/kappa results, and the full run configuration.
-    output_dir: str = "artifacts/v2_thyformer_v2_720/evaluation"
+    output_dir: str = "artifacts/v3_thyformer_720_resplit_dataset_models"
     num_gradcam_samples: int = 50
 
 
