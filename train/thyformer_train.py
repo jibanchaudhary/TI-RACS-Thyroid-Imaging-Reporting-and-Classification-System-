@@ -51,10 +51,42 @@ def build_optimizer(model: ThyFormer, cfg: ThyFormerConfig) -> AdamW:
     )
 
 
+def accum_steps(cfg: ThyFormerConfig) -> int:
+    """Micro-batches per optimiser step (>=1). batch_size * accum_steps is the
+    effective batch the optimiser actually sees."""
+    return max(int(getattr(cfg.training, "accum_steps", 1)), 1)
+
+
+def opt_steps_per_epoch(cfg: ThyFormerConfig, n_batches: int) -> int:
+    """Optimiser steps per epoch under gradient accumulation. The LR schedule and
+    warmup are counted in OPTIMISER steps, not micro-batches — counting
+    micro-batches would run the warmup accum_steps times too fast."""
+    return max(n_batches // accum_steps(cfg), 1)
+
+
 def build_scheduler(opt: AdamW, cfg: ThyFormerConfig, steps_per_epoch: int) -> CosineAnnealingLR:
+    """steps_per_epoch must be OPTIMISER steps per epoch (see opt_steps_per_epoch)."""
     warmup = cfg.training.warmup_epochs * steps_per_epoch
     total = cfg.training.epochs * steps_per_epoch
-    return CosineAnnealingLR(opt, T_max=total - warmup, eta_min=cfg.training.min_lr)
+    return CosineAnnealingLR(opt, T_max=max(total - warmup, 1), eta_min=cfg.training.min_lr)
+
+
+def set_backbone_frozen(model: ThyFormer, frozen: bool) -> int:
+    """
+    Freeze/unfreeze the pretrained Swin stages, returning the number of
+    parameters toggled. Matches get_param_groups' own convention of identifying
+    backbone parameters by the substring "swin" in their name.
+
+    Called after the optimiser is built, so frozen parameters stay in their param
+    group; their .grad simply stays None and AdamW skips them (including weight
+    decay). That lets them resume cleanly on unfreeze.
+    """
+    n = 0
+    for name, p in model.named_parameters():
+        if "swin" in name:
+            p.requires_grad = not frozen
+            n += p.numel()
+    return n
 
 
 def apply_warmup(opt: AdamW, step: int, warmup_steps: int, lr_bb: float, lr_h: float):
@@ -65,16 +97,30 @@ def apply_warmup(opt: AdamW, step: int, warmup_steps: int, lr_bb: float, lr_h: f
 
 
 class EarlyStopping:
+    """
+    Tracks the best value of the watched metric and stops after `patience`
+    non-improving epochs.
+
+    `step` exposes whether this epoch improved via `self.improved`, so callers no
+    longer have to compare against `self.best` themselves. The previous code did
+    `if watch == stopper.best` *before* calling `step`, which compares against
+    the PREVIOUS best and therefore recorded the wrong epoch's metrics as best.
+    """
+
     def __init__(self, patience: int = 10, mode: str = "max"):
         self.patience = patience
         self.mode = mode
         self.best = -1e9 if mode == "max" else 1e9
         self.counter = 0
         self.stop = False
+        self.improved = False
+
+    def is_better(self, val: float) -> bool:
+        return val > self.best if self.mode == "max" else val < self.best
 
     def step(self, val: float) -> bool:
-        improved = val > self.best if self.mode == "max" else val < self.best
-        if improved:
+        self.improved = self.is_better(val)
+        if self.improved:
             self.best = val
             self.counter = 0
         else:
@@ -84,24 +130,75 @@ class EarlyStopping:
         return self.stop
 
 
+class MetricSmoother:
+    """
+    Trailing mean of the selection metric.
+
+    With only 29 validation clips a single epoch's macro AUC carries a standard
+    error of roughly +/-0.10, so ranking checkpoints on the raw per-epoch value
+    reliably selects the luckiest epoch rather than the best model — ep005's
+    val_auc 0.8223 sat between 0.745 and 0.689 and tested at 0.5798. Averaging
+    over a short window suppresses that spike.
+
+    window <= 1 disables smoothing (returns the raw value).
+    """
+
+    def __init__(self, window: int = 1):
+        self.window = max(int(window), 1)
+        self.history: List[float] = []
+
+    def __call__(self, val: float) -> float:
+        if not (val == val) or val in (float("inf"), float("-inf")):
+            # Non-finite epochs carry no information; don't poison the window.
+            return val
+        self.history.append(float(val))
+        w = self.history[-self.window :]
+        return sum(w) / len(w)
+
+
 class CheckpointManager:
-    def __init__(self, save_dir: str, top_k: int = 3):
+    """
+    Keeps the top-k checkpoints ranked by the SAME metric early stopping watches.
+
+    Previously this ranked by `val_auc` while EarlyStopping watched `val_loss`, so
+    `best` was the peak of a noisy 29-clip AUC and disagreed with the stopping
+    criterion. `metric`/`mode` now come from cfg.training.early_stopping_metric /
+    _mode, and the score written into each filename is the (optionally smoothed)
+    selection score, not a raw AUC.
+    """
+
+    def __init__(
+        self,
+        save_dir: str,
+        top_k: int = 3,
+        metric: str = "val_loss",
+        mode: str = "min",
+    ):
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.top_k = top_k
-        self.saved: List[tuple] = []  # (score, path)
+        self.metric = metric
+        self.mode = mode
+        self.saved: List[tuple] = []  # (score, path), best first
         self._scan_existing()
 
+    def _sort(self):
+        # Best first: descending for "max", ascending for "min".
+        self.saved.sort(key=lambda x: x[0], reverse=(self.mode == "max"))
+
     def _scan_existing(self):
-        """Rebuild saved list from any .pt files already on disk (needed for resume)."""
-        for p in sorted(self.save_dir.glob("ep*_auc*.pt")):
-            try:
-                auc_str = p.stem.split("_auc")[-1]
-                score = float(auc_str)
-                self.saved.append((score, p))
-            except ValueError:
-                pass
-        self.saved.sort(key=lambda x: x[0], reverse=True)
+        """Rebuild saved list from any .pt files already on disk (needed for resume).
+        Accepts the current `ep000_score1.2345.pt` scheme and the legacy
+        `ep000_auc0.8223.pt` one so old runs remain resumable."""
+        for token in ("_score", "_auc"):
+            for p in sorted(self.save_dir.glob(f"ep*{token}*.pt")):
+                if any(p == q for _, q in self.saved):
+                    continue
+                try:
+                    self.saved.append((float(p.stem.split(token)[-1]), p))
+                except ValueError:
+                    pass
+        self._sort()
 
     def save(
         self,
@@ -112,25 +209,33 @@ class CheckpointManager:
         cfg: ThyFormerConfig,
         scheduler=None,
         scaler=None,
+        score: Optional[float] = None,
     ) -> Path:
-        score = metrics.get("val_auc", 0.0)
-        path = self.save_dir / f"ep{epoch:03d}_auc{score:.4f}.pt"
+        """`score` is the selection score to rank on (smoothed, when smoothing is
+        enabled). Falls back to the raw configured metric."""
+        if score is None:
+            score = metrics.get(self.metric, 0.0)
+        path = self.save_dir / f"ep{epoch:03d}_score{score:.4f}.pt"
         payload = {
             "epoch": epoch,
             "model": model.state_dict(),
             "optimizer": opt.state_dict(),
             "metrics": metrics,
             "config": cfg,
+            # Provenance so a checkpoint can never be misread as "best AUC" again.
+            "selection_metric": self.metric,
+            "selection_mode": self.mode,
+            "selection_score": float(score),
         }
         if scheduler is not None:
             payload["scheduler"] = scheduler.state_dict()
         if scaler is not None:
             payload["scaler"] = scaler.state_dict()
         torch.save(payload, path)
-        self.saved.append((score, path))
-        self.saved.sort(key=lambda x: x[0], reverse=True)
+        self.saved.append((float(score), path))
+        self._sort()
         while len(self.saved) > self.top_k:
-            _, old = self.saved.pop()
+            _, old = self.saved.pop()  # worst, since _sort puts best first
             if old.exists():
                 old.unlink()
         return path
@@ -146,40 +251,65 @@ def train_one_epoch(
     model.train()
     device = next(model.parameters()).device
     amp_enabled, amp_dtype = amp_settings(cfg)
-    warmup_steps = cfg.training.warmup_epochs * len(loader)
+    accum = accum_steps(cfg)
+    # Warmup and the cosine schedule advance per OPTIMISER step, so their horizons
+    # are expressed in optimiser steps too. `global_step` is an optimiser step
+    # counter (it used to count micro-batches).
+    warmup_steps = cfg.training.warmup_epochs * opt_steps_per_epoch(cfg, len(loader))
     total_loss = 0.0
     n_batches = 0
     n_nonfinite = 0
     all_logits, all_labels = [], []
 
-    for step, batch in enumerate(loader):
-        apply_warmup(opt, global_step, warmup_steps, cfg.training.lr_backbone, cfg.training.lr_head)
+    def optimizer_step(grad_rescale: float = 1.0):
+        """One optimiser step on the accumulated gradients.
 
+        `grad_rescale` corrects a short final group: each micro-batch contributed
+        loss/accum, so a group of m < accum micro-batches is under-weighted by
+        accum/m. Rescaling after unscale_ makes the partial group equivalent to a
+        full one instead of silently taking a smaller step.
+        """
+        nonlocal global_step
+        apply_warmup(opt, global_step, warmup_steps, cfg.training.lr_backbone, cfg.training.lr_head)
+        scaler.unscale_(opt)
+        if grad_rescale != 1.0:
+            for group in opt.param_groups:
+                for p in group["params"]:
+                    if p.grad is not None:
+                        p.grad.mul_(grad_rescale)
+        nn.utils.clip_grad_norm_(model.parameters(), cfg.training.gradient_clip_val)
+        scaler.step(opt)
+        scaler.update()
+        opt.zero_grad(set_to_none=True)
+        if global_step >= warmup_steps:
+            scheduler.step()
+        global_step += 1
+
+    opt.zero_grad(set_to_none=True)
+    micro = 0  # micro-batches accumulated into the current optimiser step
+
+    for step, batch in enumerate(loader):
         imgs = batch["image"].to(device, non_blocking=True)
         lbs = batch["label"].to(device, non_blocking=True)
         msks = batch["mask"].to(device, non_blocking=True)
         bnds = batch["boundary"].to(device, non_blocking=True)
 
-        opt.zero_grad()
         with autocast(device_type="cuda", dtype=amp_dtype, enabled=amp_enabled):
             preds = model(imgs)
             losses = loss_fn(preds, {"label": lbs, "mask": msks, "boundary": bnds}, epoch=epoch)
             loss = losses["loss_total"]
 
-        # Skip non-finite batches so one bad step can't corrupt the weights.
+        # Skip non-finite batches so one bad step can't corrupt the weights. A
+        # skipped micro-batch contributes no gradient, so it must not count
+        # toward the accumulation group either.
         if not torch.isfinite(loss):
             n_nonfinite += 1
-            global_step += 1
             continue
 
-        scaler.scale(loss).backward()
-        scaler.unscale_(opt)
-        nn.utils.clip_grad_norm_(model.parameters(), cfg.training.gradient_clip_val)
-        scaler.step(opt)
-        scaler.update()
-
-        if global_step >= warmup_steps:
-            scheduler.step()
+        # Scale by 1/accum so the accumulated gradient is the MEAN over the
+        # effective batch, matching what batch_size=accum*batch_size would give.
+        scaler.scale(loss / accum).backward()
+        micro += 1
 
         total_loss += loss.item()
         n_batches += 1
@@ -187,9 +317,16 @@ def train_one_epoch(
         hard = lbs.argmax(1) if lbs.dim() == 2 else lbs
         all_labels.append(hard.cpu())
 
+        if micro == accum:
+            optimizer_step()
+            micro = 0
+
         if step % cfg.training.log_interval == 0:
             logger.log_step(epoch, step, len(loader), losses, opt.param_groups[0]["lr"])
-        global_step += 1
+
+    # Flush a trailing partial group (len(loader) need not divide by accum).
+    if micro > 0:
+        optimizer_step(grad_rescale=accum / micro)
 
     if n_nonfinite:
         print(f"  ⚠ skipped {n_nonfinite} non-finite loss batch(es) this epoch")
@@ -239,12 +376,22 @@ def train(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     opt = build_optimizer(model, cfg)
-    sched = build_scheduler(opt, cfg, len(dataloaders["train"]))
+    accum = accum_steps(cfg)
+    steps_per_epoch = opt_steps_per_epoch(cfg, len(dataloaders["train"]))
+    sched = build_scheduler(opt, cfg, steps_per_epoch)
     # GradScaler is only needed for fp16 (bf16 has fp32 range; scaling is a no-op/harmful).
     _, amp_dtype = amp_settings(cfg)
     scaler = GradScaler(enabled=cfg.training.fp16 and amp_dtype == torch.float16)
-    stopper = EarlyStopping(cfg.training.early_stopping_patience, cfg.training.early_stopping_mode)
-    ckpt_mgr = CheckpointManager(cfg.training.checkpoint_dir, cfg.training.save_top_k)
+    sel_metric = cfg.training.early_stopping_metric
+    sel_mode = cfg.training.early_stopping_mode
+    stopper = EarlyStopping(cfg.training.early_stopping_patience, sel_mode)
+    smoother = MetricSmoother(getattr(cfg.training, "selection_smoothing_epochs", 1))
+    # Checkpoint ranking and early stopping now share one metric and one mode.
+    ckpt_mgr = CheckpointManager(
+        cfg.training.checkpoint_dir, cfg.training.save_top_k, sel_metric, sel_mode
+    )
+    freeze_epochs = int(getattr(cfg.training, "freeze_backbone_epochs", 0))
+    backbone_frozen = False
     logger = MetricLogger(
         cfg.training.log_dir,
         cfg.training.use_wandb,
@@ -268,8 +415,9 @@ def train(
         if "scaler" in ckpt:
             scaler.load_state_dict(ckpt["scaler"])
         start_epoch = ckpt["epoch"] + 1
-        global_step = start_epoch * len(dataloaders["train"])
-        prev_metric = ckpt["metrics"].get(cfg.training.early_stopping_metric, stopper.best)
+        # global_step counts OPTIMISER steps (see train_one_epoch).
+        global_step = start_epoch * steps_per_epoch
+        prev_metric = ckpt.get("selection_score", ckpt["metrics"].get(sel_metric, stopper.best))
         stopper.best = prev_metric
         print(
             f"Resumed from {resume_path.name}  (epoch {ckpt['epoch']} → continuing at {start_epoch})"
@@ -278,13 +426,30 @@ def train(
     print(f"\nTraining ThyFormer on {device}")
     print(
         f"Epochs {cfg.training.epochs}  |  "
-        f"Batch {cfg.training.batch_size}  |  "
-        f"FP16 {cfg.training.fp16}"
+        f"Batch {cfg.training.batch_size} x {accum} accum "
+        f"= effective {cfg.training.batch_size * accum}  |  "
+        f"FP16 {cfg.training.fp16} ({getattr(cfg.training, 'amp_dtype', 'fp16')})"
+    )
+    print(
+        f"Selection: {sel_metric} ({sel_mode}), "
+        f"smoothed over {smoother.window} epoch(s)  |  "
+        f"backbone frozen for first {freeze_epochs} epoch(s)"
     )
     print("─" * 60)
 
     for epoch in range(start_epoch, cfg.training.epochs):
         t0 = time.time()
+
+        # Freeze the pretrained Swin stages while the random head/stem settles,
+        # then release them — matching the baseline's freeze_epochs=3.
+        want_frozen = epoch < freeze_epochs
+        if want_frozen != backbone_frozen:
+            n = set_backbone_frozen(model, want_frozen)
+            print(
+                f"  {'❄ froze' if want_frozen else '🔥 unfroze'} Swin backbone "
+                f"({n / 1e6:.1f}M params) at epoch {epoch}"
+            )
+            backbone_frozen = want_frozen
 
         train_m, global_step = train_one_epoch(
             model,
@@ -304,15 +469,26 @@ def train(
         logger.log_epoch({**train_m, **val_m, "epoch": epoch})
         _print_epoch(epoch, time.time() - t0, train_m, val_m)
 
-        ckpt_mgr.save(model, opt, epoch, val_m, cfg, scheduler=sched, scaler=scaler)
+        # One selection signal for both checkpoint ranking and early stopping:
+        # the configured metric, smoothed over a short window.
+        raw = val_m.get(sel_metric, 0.0)
+        watch = smoother(raw)
+        val_m[f"{sel_metric}_smoothed"] = watch
+        if smoother.window > 1:
+            print(f"      selection {sel_metric}: raw {raw:.4f} → smoothed {watch:.4f}")
 
-        watch = val_m.get(cfg.training.early_stopping_metric, 0.0)
-        if watch == stopper.best:
+        ckpt_mgr.save(model, opt, epoch, val_m, cfg, scheduler=sched, scaler=scaler, score=watch)
+
+        # `step` sets `improved` internally, so best_metrics is recorded for the
+        # epoch that actually improved. The old `watch == stopper.best` test ran
+        # BEFORE step() and so compared against the previous best.
+        stop = stopper.step(watch)
+        if stopper.improved:
             best_metrics = val_m.copy()
-        if stopper.step(watch):
+        if stop:
             print(
                 f"\nEarly stopping at epoch {epoch}. "
-                f"Best {cfg.training.early_stopping_metric}: {stopper.best:.4f}"
+                f"Best {sel_metric} ({sel_mode}, smoothed): {stopper.best:.4f}"
             )
             break
 

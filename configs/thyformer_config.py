@@ -35,6 +35,7 @@ class AugmentationConfig:
     contrast_limit: float = 0.15
     mixup_alpha: float = 0.2
     mixup_p: float = 0.3
+    mixup_min_batch_size: int = 8  # mixup off below this batch size
 
 
 @dataclass
@@ -68,6 +69,7 @@ class LossConfig:
 class TrainingConfig:
     epochs: int = 30
     batch_size: int = 2  # 720x720 has ~10x the tokens of 224; 8GB GPU limit
+    accum_steps: int = 8  # effective batch = batch_size * accum_steps (2x8=16)
     num_workers: int = 8
     pin_memory: bool = True
     fp16: bool = True  # master switch for mixed-precision (AMP)
@@ -83,10 +85,12 @@ class TrainingConfig:
     betas: Tuple[float, float] = (0.9, 0.999)
     scheduler: str = "cosine"
     warmup_epochs: int = 3
+    freeze_backbone_epochs: int = 3  # epochs the pretrained Swin stages stay frozen
     min_lr: float = 1e-6
     early_stopping_patience: int = 5
-    early_stopping_metric: str = "val_loss"
+    early_stopping_metric: str = "val_loss"  # also ranks checkpoints
     early_stopping_mode: str = "min"
+    selection_smoothing_epochs: int = 3  # trailing-mean window; 1 = off
     checkpoint_dir: str = "artifacts/v3_thyformer_720_resplit_dataset_models/checkpoints"
     save_top_k: int = 3
     log_dir: str = "artifacts/v3_thyformer_720_resplit_dataset_models/logs"
@@ -100,11 +104,7 @@ class TrainingConfig:
 @dataclass
 class EvaluationConfig:
     primary_metric: str = "val_auc"
-    # Root folder for evaluation runs. thyformer_evaluate.py writes a
-    # timestamped subfolder here with metrics, figures (ROC/PR/confusion
-    # matrix/per-class bars), per-sample predictions, GradCAM heatmaps,
-    # DeLong/kappa results, and the full run configuration.
-    output_dir: str = "artifacts/v3_thyformer_720_resplit_dataset_models"
+    output_dir: str = "artifacts/v3/evaluation_thyformer_baseline_trained"
     num_gradcam_samples: int = 50
 
 

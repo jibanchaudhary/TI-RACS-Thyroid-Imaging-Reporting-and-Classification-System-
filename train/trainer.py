@@ -307,7 +307,7 @@ class Trainer:
         lr: float = 3e-4,
         weight_decay: float = 1e-4,
         warmup_epochs: int = 3,
-        freeze_epochs: int = 5,
+        freeze_epochs: int = 3,
         patience: int = 5,
         label_smoothing: float = 0.1,
         use_amp: bool = True,
@@ -365,7 +365,11 @@ class Trainer:
         # Datasets
         self.train_ds = ThyroidDataset(data_dir, "train", backbone)
         self.val_ds = ThyroidDataset(data_dir, "val", backbone)
-        self._log(f"Train samples: {len(self.train_ds)} | Val samples: {len(self.val_ds)}")
+        self.test_ds = ThyroidDataset(data_dir, "test", backbone)
+        self._log(
+            f"Train samples: {len(self.train_ds)} | Val samples: {len(self.val_ds)} | "
+            f"Test samples: {len(self.test_ds)}"
+        )
         sampler = self.train_ds.get_weighted_sampler()
         self.train_loader = DataLoader(
             self.train_ds,
@@ -377,6 +381,13 @@ class Trainer:
         )
         self.val_loader = DataLoader(
             self.val_ds,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True,
+        )
+        self.test_loader = DataLoader(
+            self.test_ds,
             batch_size=batch_size,
             shuffle=False,
             num_workers=num_workers,
@@ -595,6 +606,12 @@ class Trainer:
         except Exception as e:
             self._log(f"Could not plot training curves: {e}")
         self._final_eval(best_ckpt_path)
+        self._final_eval(
+            best_ckpt_path,
+            loader=self.test_loader,
+            split_label="test",
+            plots_dir=os.path.join(self.plots_dir, "test"),
+        )
         return best_ckpt_path
 
     def _save_checkpoint(self, epoch, val_loss, val_acc, path, best_val_loss, patience_count):
@@ -683,14 +700,26 @@ class Trainer:
                 writer.writerow([r.get(k) or "nan" for k in self.LOG_FIELDS])
 
     @torch.no_grad()
-    def _final_eval(self, ckpt_path: str):
-        """Load best checkpoint and print full classification report on val set."""
+    def _final_eval(
+        self,
+        ckpt_path: str,
+        loader=None,
+        split_label: str = "validation",
+        plots_dir: str | None = None,
+    ):
+        """Load best checkpoint and print a full classification report + save
+        plots on `loader` (validation set by default, or the held-out test set).
+        `plots_dir` defaults to the run's plots/ dir so test outputs can be kept
+        separate (e.g. plots/test/)."""
+        loader = loader if loader is not None else self.val_loader
+        plots_dir = plots_dir if plots_dir is not None else self.plots_dir
+
         state = torch.load(ckpt_path, map_location=self.device)
         self.model.load_state_dict(state["model_state_dict"])
         self.model.eval()
 
         all_preds, all_labels, all_probs = [], [], []
-        for images, labels in self.val_loader:
+        for images, labels in loader:
             images = images.to(self.device)
             logits = self.model(images)
             probs = torch.softmax(logits, dim=-1)
@@ -698,7 +727,7 @@ class Trainer:
             all_labels.extend(labels.tolist())
             all_probs.extend(probs.cpu().tolist())
 
-        self._log("\n--- Final validation report ---")
+        self._log(f"\n--- Final {split_label} report ---")
         unique_labels = sorted(set(all_labels) | set(all_preds))
 
         report = classification_report(
@@ -717,7 +746,7 @@ class Trainer:
             macro_auc = roc_auc_score(y_bin, all_probs, multi_class="ovr", average="macro")
             self._log(f"Macro AUC: {macro_auc:.4f}")
         except ValueError:
-            self._log("AUC: not computable (too few classes in val set)")
+            self._log(f"AUC: not computable (too few classes in {split_label} set)")
 
         # Confusion matrix
         cm = confusion_matrix(all_labels, all_preds, labels=unique_labels)
@@ -725,7 +754,15 @@ class Trainer:
         self._log(str(cm))
 
         self._save_eval_plots(
-            all_labels, all_preds, all_probs, cm, unique_labels, report, macro_auc
+            all_labels,
+            all_preds,
+            all_probs,
+            cm,
+            unique_labels,
+            report,
+            macro_auc,
+            plots_dir,
+            split_label,
         )
 
     # ------------------------------------------------------------------
@@ -736,15 +773,39 @@ class Trainer:
         plot_training_curves(self.log_path, self.plots_dir, self.backbone)
 
     def _save_eval_plots(
-        self, all_labels, all_preds, all_probs, cm, unique_labels, report, macro_auc
+        self,
+        all_labels,
+        all_preds,
+        all_probs,
+        cm,
+        unique_labels,
+        report,
+        macro_auc,
+        plots_dir=None,
+        split_label="validation",
     ):
+        plots_dir = plots_dir if plots_dir is not None else self.plots_dir
+        os.makedirs(plots_dir, exist_ok=True)
         plots = (
-            ("confusion_matrix.png", lambda: self._plot_confusion_matrix(cm, unique_labels)),
-            ("roc_curves.png", lambda: self._plot_roc_curves(all_labels, all_probs, macro_auc)),
-            ("pr_curves.png", lambda: self._plot_pr_curves(all_labels, all_probs)),
+            (
+                "confusion_matrix.png",
+                lambda: self._plot_confusion_matrix(cm, unique_labels, plots_dir, split_label),
+            ),
+            (
+                "roc_curves.png",
+                lambda: self._plot_roc_curves(
+                    all_labels, all_probs, macro_auc, plots_dir, split_label
+                ),
+            ),
+            (
+                "pr_curves.png",
+                lambda: self._plot_pr_curves(all_labels, all_probs, plots_dir, split_label),
+            ),
             (
                 "per_class_metrics.png",
-                lambda: self._plot_per_class_bars(all_labels, all_preds, unique_labels),
+                lambda: self._plot_per_class_bars(
+                    all_labels, all_preds, unique_labels, plots_dir, split_label
+                ),
             ),
         )
         for name, fn in plots:
@@ -754,7 +815,7 @@ class Trainer:
                 print(f"  Could not plot {name}: {e}")
 
         try:
-            report_path = os.path.join(self.plots_dir, "classification_report.txt")
+            report_path = os.path.join(plots_dir, "classification_report.txt")
             with open(report_path, "w") as f:
                 f.write(report + "\n")
                 if macro_auc is not None:
@@ -763,7 +824,8 @@ class Trainer:
         except Exception as e:
             print(f"  Could not save classification report: {e}")
 
-    def _plot_confusion_matrix(self, cm, unique_labels):
+    def _plot_confusion_matrix(self, cm, unique_labels, plots_dir=None, split_label="validation"):
+        plots_dir = plots_dir if plots_dir is not None else self.plots_dir
         names = [CLASS_NAMES[i] for i in unique_labels]
         cm = np.asarray(cm)
         cm_norm = cm / np.maximum(cm.sum(axis=1, keepdims=True), 1)
@@ -800,14 +862,19 @@ class Trainer:
             cbar.ax.tick_params(colors=PLOT_MUTED, labelsize=8)
             cbar.outline.set_edgecolor(PLOT_GRID)
 
-        fig.suptitle(f"{self.backbone} — validation confusion matrix", color=PLOT_INK, fontsize=13)
+        fig.suptitle(
+            f"{self.backbone} — {split_label} confusion matrix", color=PLOT_INK, fontsize=13
+        )
         fig.tight_layout(rect=(0, 0, 1, 0.94))
-        out = os.path.join(self.plots_dir, "confusion_matrix.png")
+        out = os.path.join(plots_dir, "confusion_matrix.png")
         fig.savefig(out, dpi=150, facecolor=PLOT_SURFACE)
         plt.close(fig)
         print(f"  Saved {out}")
 
-    def _plot_roc_curves(self, all_labels, all_probs, macro_auc):
+    def _plot_roc_curves(
+        self, all_labels, all_probs, macro_auc, plots_dir=None, split_label="validation"
+    ):
+        plots_dir = plots_dir if plots_dir is not None else self.plots_dir
         probs = np.asarray(all_probs)
         y_bin = label_binarize(all_labels, classes=list(range(NUM_CLASSES)))
         if y_bin.shape[1] == 1:
@@ -832,18 +899,19 @@ class Trainer:
         ax.set_ylim(-0.02, 1.05)
         ax.set_xlabel("False positive rate", color=PLOT_INK_2, fontsize=10)
         ax.set_ylabel("True positive rate", color=PLOT_INK_2, fontsize=10)
-        title = f"{self.backbone} — validation ROC (one-vs-rest)"
+        title = f"{self.backbone} — {split_label} ROC (one-vs-rest)"
         if macro_auc is not None:
             title += f"\nmacro AUC {macro_auc:.3f}"
         ax.set_title(title, color=PLOT_INK, fontsize=11)
         ax.legend(frameon=False, fontsize=9, labelcolor=PLOT_INK_2, loc="lower right")
         fig.tight_layout()
-        out = os.path.join(self.plots_dir, "roc_curves.png")
+        out = os.path.join(plots_dir, "roc_curves.png")
         fig.savefig(out, dpi=150, facecolor=PLOT_SURFACE)
         plt.close(fig)
         print(f"  Saved {out}")
 
-    def _plot_pr_curves(self, all_labels, all_probs):
+    def _plot_pr_curves(self, all_labels, all_probs, plots_dir=None, split_label="validation"):
+        plots_dir = plots_dir if plots_dir is not None else self.plots_dir
         probs = np.asarray(all_probs)
         y_bin = label_binarize(all_labels, classes=list(range(NUM_CLASSES)))
         if y_bin.shape[1] == 1:
@@ -869,18 +937,21 @@ class Trainer:
         ax.set_xlabel("Recall", color=PLOT_INK_2, fontsize=10)
         ax.set_ylabel("Precision", color=PLOT_INK_2, fontsize=10)
         ax.set_title(
-            f"{self.backbone} — validation precision-recall (one-vs-rest)",
+            f"{self.backbone} — {split_label} precision-recall (one-vs-rest)",
             color=PLOT_INK,
             fontsize=11,
         )
         ax.legend(frameon=False, fontsize=9, labelcolor=PLOT_INK_2, loc="lower left")
         fig.tight_layout()
-        out = os.path.join(self.plots_dir, "pr_curves.png")
+        out = os.path.join(plots_dir, "pr_curves.png")
         fig.savefig(out, dpi=150, facecolor=PLOT_SURFACE)
         plt.close(fig)
         print(f"  Saved {out}")
 
-    def _plot_per_class_bars(self, all_labels, all_preds, unique_labels):
+    def _plot_per_class_bars(
+        self, all_labels, all_preds, unique_labels, plots_dir=None, split_label="validation"
+    ):
+        plots_dir = plots_dir if plots_dir is not None else self.plots_dir
         p, r, f1, support = precision_recall_fscore_support(
             all_labels, all_preds, labels=unique_labels, zero_division=0
         )
@@ -907,9 +978,11 @@ class Trainer:
             loc="lower center",
             bbox_to_anchor=(0.5, 1.0),
         )
-        fig.suptitle(f"{self.backbone} — per-class validation metrics", color=PLOT_INK, fontsize=12)
+        fig.suptitle(
+            f"{self.backbone} — per-class {split_label} metrics", color=PLOT_INK, fontsize=12
+        )
         fig.tight_layout(rect=(0, 0, 1, 0.90))
-        out = os.path.join(self.plots_dir, "per_class_metrics.png")
+        out = os.path.join(plots_dir, "per_class_metrics.png")
         fig.savefig(out, dpi=150, facecolor=PLOT_SURFACE)
         plt.close(fig)
         print(f"  Saved {out}")
@@ -920,7 +993,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--backbone", type=str, default="all", help="convnext|efficientnet|swin|vit|all"
     )
-    parser.add_argument("--data_dir", type=str, default="data")
+    parser.add_argument(
+        "--data_dir",
+        type=str,
+        default="/home/jiban/Documents/TI-RACS/resplit_stanford_dataset",
+        help="Folder containing train.csv / val.csv / test.csv",
+    )
     parser.add_argument("--output_dir", type=str, default="artifacts/ckpts")
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch_size", type=int, default=192)

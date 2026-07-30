@@ -7,7 +7,7 @@ ThyFormer — Evaluation Metrics
 • Ordinal grade metrics: within-one-grade accuracy, grade MAE (TI-RADS is ordinal)
 • Calibration: ECE, MCE, multiclass Brier score (+ reliability-diagram bins)
 • Bootstrap 95% confidence intervals for every scalar metric
-• DeLong's test (bootstrap) for significance comparison
+• Paired cluster bootstrap (over clips) for model-vs-model significance
 • Cohen's kappa for clinical radiologist agreement
 """
 import warnings
@@ -184,6 +184,47 @@ def compute_metrics(
     return {f"{prefix}_{k}": v for k, v in _scalar_metrics(y, probs, num_classes).items()}
 
 
+def clip_ids(stems: List[str]) -> np.ndarray:
+    """
+    Clip (video) id for each frame stem: "138_69" -> "138".
+
+    The Stanford frames are video frames — every clip contributes many
+    near-duplicate frames that share one label. The clip, not the frame, is the
+    independent sampling unit, so every bootstrap in this module resamples these
+    ids rather than rows. See ``_resampler``.
+    """
+    return np.array([str(s).split("_")[0] for s in stems])
+
+
+def _resampler(groups: Optional[np.ndarray], n: int):
+    """
+    Build a bootstrap index generator.
+
+    With ``groups`` (one clip id per sample) this is a *cluster* bootstrap: whole
+    clips are drawn with replacement and every frame of a drawn clip comes along.
+    That is the statistically correct unit here — frames within a clip are
+    near-duplicates of one nodule, so resampling them independently treats
+    ~29 real observations as ~3066 and understates the standard error by roughly
+    sqrt(frames/clips) (~10x on this test set), which is what produced
+    "p = 0.0000" for differences that are not resolvable at this sample size.
+
+    Without ``groups`` it degrades to the old i.i.d. row bootstrap.
+
+    Returns (draw_fn, n_units) where draw_fn(rng) -> integer index array.
+    """
+    if groups is None:
+        return (lambda rng: rng.integers(0, n, n)), n
+
+    uniq = np.unique(groups)
+    idx_by_clip = [np.where(groups == c)[0] for c in uniq]
+
+    def draw(rng):
+        pick = rng.integers(0, len(uniq), len(uniq))
+        return np.concatenate([idx_by_clip[i] for i in pick])
+
+    return draw, len(uniq)
+
+
 def bootstrap_cis(
     y: np.ndarray,
     probs: np.ndarray,
@@ -191,6 +232,7 @@ def bootstrap_cis(
     alpha: float = 0.05,
     seed: int = 42,
     num_classes: int = 5,
+    groups: Optional[np.ndarray] = None,
 ) -> Dict[str, Dict[str, float]]:
     """
     Percentile-bootstrap 95% CIs for every scalar metric.
@@ -200,16 +242,21 @@ def bootstrap_cis(
     percentiles. Resamples that drop a class entirely are skipped (they would
     zero the OvR AUC and poison the percentiles).
 
+    ``groups`` (per-sample clip ids from ``clip_ids``) switches this to a cluster
+    bootstrap over clips — required for honest interval widths on frame-level
+    video data. Omitting it reproduces the old, over-narrow frame-level CIs.
+
     Returns {metric: {"value": point_estimate, "ci_low": lo, "ci_high": hi}}.
     """
     rng = np.random.default_rng(seed)
     n = len(y)
     present = np.unique(y)
     point = _scalar_metrics(y, probs, num_classes)
+    draw, _ = _resampler(groups, n)
 
     samples: Dict[str, List[float]] = {k: [] for k in point}
     for _ in tqdm(range(n_bootstrap), desc="Bootstrap CIs", unit="it", leave=False):
-        idx = rng.integers(0, n, n)
+        idx = draw(rng)
         if len(np.unique(y[idx])) < len(present):
             continue
         for k, v in _scalar_metrics(y[idx], probs[idx], num_classes).items():
@@ -226,30 +273,113 @@ def bootstrap_cis(
     return out
 
 
-def delong_test(
-    labels: np.ndarray, probs_a: np.ndarray, probs_b: np.ndarray, n_bootstrap: int = 1000
-) -> Tuple[float, float, float, float]:
+def paired_auc_test(
+    labels: np.ndarray,
+    probs_a: np.ndarray,
+    probs_b: np.ndarray,
+    n_bootstrap: int = 1000,
+    groups: Optional[np.ndarray] = None,
+    seed: int = 42,
+) -> Dict[str, float]:
     """
-    Bootstrap DeLong test comparing macro AUC of two models.
-    Returns (auc_a, auc_b, z, p_value).
+    Paired bootstrap test on the macro-AUC difference between two models
+    evaluated on the same samples.
+
+    This is NOT DeLong's test (it was previously mislabelled as such). DeLong's
+    test uses the analytic covariance of the Mann-Whitney statistic and assumes
+    independent observations; this is a paired *cluster* bootstrap, which is the
+    appropriate tool here because the observations are video frames nested in
+    clips. Pass ``groups`` (per-frame clip ids from ``clip_ids``) so whole clips
+    are resampled — see ``_resampler`` for why the frame-level version is invalid.
+
+    Both models must be scored on the same samples in the same order, so each
+    resample re-scores both models on one index set (paired), which cancels the
+    shared sampling noise.
+
+    Returns a dict with both AUCs, the difference, a percentile CI on the
+    difference, and the two-sided bootstrap p-value.
     """
-    rng = np.random.default_rng(42)
+    rng = np.random.default_rng(seed)
     n = len(labels)
     nc_a, nc_b = probs_a.shape[1], probs_b.shape[1]
     _, auc_a = _ovr_auc(labels, probs_a, nc_a)
     _, auc_b = _ovr_auc(labels, probs_b, nc_b)
+    draw, n_units = _resampler(groups, n)
 
     diffs = []
-    for _ in tqdm(range(n_bootstrap), desc="DeLong bootstrap", unit="it", leave=False):
-        idx = rng.integers(0, n, n)
-        _, da = _ovr_auc(labels[idx], probs_a[idx], nc_a)
-        _, db = _ovr_auc(labels[idx], probs_b[idx], nc_b)
+    for _ in tqdm(range(n_bootstrap), desc="Paired AUC bootstrap", unit="it", leave=False):
+        idx = draw(rng)
+        yb = labels[idx]
+        if len(np.unique(yb)) < 2:  # degenerate resample — no AUC is defined
+            continue
+        _, da = _ovr_auc(yb, probs_a[idx], nc_a)
+        _, db = _ovr_auc(yb, probs_b[idx], nc_b)
         diffs.append(da - db)
 
-    se = np.std(diffs)
-    z = (auc_a - auc_b) / max(se, 1e-9)
-    p = 2.0 * (1.0 - stats.norm.cdf(abs(z)))
-    return float(auc_a), float(auc_b), float(z), float(p)
+    diffs = np.asarray(diffs, dtype=float)
+    obs = auc_a - auc_b
+    if diffs.size == 0:
+        return {
+            "auc_a": float(auc_a),
+            "auc_b": float(auc_b),
+            "auc_difference": float(obs),
+            "diff_ci_low": float("nan"),
+            "diff_ci_high": float("nan"),
+            "z_statistic": float("nan"),
+            "p_value": float("nan"),
+            "n_bootstrap_used": 0,
+            "n_units": int(n_units),
+            "n_samples": int(n),
+            "unit": "clip" if groups is not None else "frame",
+            "method": "paired cluster bootstrap" if groups is not None else "paired bootstrap",
+        }
+
+    se = float(diffs.std(ddof=1)) if diffs.size > 1 else 0.0
+    z = obs / max(se, 1e-9)
+    # Two-sided percentile p: how often the resampled difference falls on the
+    # other side of zero. Floor at 1/n_bootstrap — a bootstrap can never
+    # legitimately report p = 0.
+    tail = min(float((diffs <= 0).mean()), float((diffs >= 0).mean()))
+    p = max(2.0 * tail, 1.0 / diffs.size)
+    lo, hi = np.percentile(diffs, [2.5, 97.5])
+    return {
+        "auc_a": float(auc_a),
+        "auc_b": float(auc_b),
+        "auc_difference": float(obs),
+        "diff_ci_low": float(lo),
+        "diff_ci_high": float(hi),
+        "diff_se": se,
+        "z_statistic": float(z),
+        "p_value": float(p),
+        "p_value_normal": float(2.0 * (1.0 - stats.norm.cdf(abs(z)))),
+        "n_bootstrap_used": int(diffs.size),
+        "n_units": int(n_units),
+        "n_samples": int(n),
+        "unit": "clip" if groups is not None else "frame",
+        "method": "paired cluster bootstrap" if groups is not None else "paired bootstrap",
+    }
+
+
+def aggregate_by_group(
+    y: np.ndarray, probs: np.ndarray, groups: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Collapse frame-level predictions to one row per clip by averaging the
+    probability vectors (labels are constant within a clip, so ``first`` is
+    exact). Returns (y_clip, probs_clip, clip_ids) ordered by clip id.
+
+    Clip-level metrics answer the clinically meaningful question — "how many
+    nodules did it grade correctly" — instead of weighting each nodule by how
+    many frames its video happens to contain (25 to 293 here).
+    """
+    uniq = np.unique(groups)
+    yc = np.empty(len(uniq), dtype=y.dtype)
+    pc = np.empty((len(uniq), probs.shape[1]), dtype=float)
+    for i, c in enumerate(uniq):
+        m = groups == c
+        yc[i] = y[m][0]
+        pc[i] = probs[m].mean(axis=0)
+    return yc, pc, uniq
 
 
 def compute_kappa(

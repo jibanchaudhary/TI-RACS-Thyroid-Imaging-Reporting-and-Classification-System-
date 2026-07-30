@@ -33,11 +33,15 @@ class DespecklingCNNStem(nn.Module):
         super().__init__()
         self.dw = nn.Conv2d(in_ch, in_ch, kernel, padding=kernel // 2, groups=in_ch, bias=False)
         self.pw = nn.Conv2d(in_ch, in_ch, 1, bias=False)
-        self.norm = nn.GroupNorm(num_groups=in_ch, num_channels=in_ch)
+        # self.norm = nn.GroupNorm(num_groups=in_ch, num_channels=in_ch)
         self.act = nn.GELU()
-        self.pe = nn.Conv2d(in_ch, out_ch, patch, stride=patch, bias=False)
-        self.ln = nn.LayerNorm(out_ch)
+        # self.pe = nn.Conv2d(in_ch, out_ch, patch, stride=patch, bias=False)
+        # self.ln = nn.LayerNorm(out_ch)
+        self.out = nn.Conv2d(in_ch, in_ch, 1, bias=False)
         self._init_gaussian(kernel)
+        with torch.no_grad():
+            self.pw.weight.copy_(torch.eye(in_ch).view(in_ch, in_ch, 1, 1))
+            self.out.weight.zero_()
 
     def _init_gaussian(self, k: int):
         with torch.no_grad():
@@ -48,12 +52,13 @@ class DespecklingCNNStem(nn.Module):
             self.dw.weight.data.copy_(ker.unsqueeze(0).unsqueeze(0).expand(self.dw.weight.shape))
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, int, int]:
-        """x: [B,3,H,W]  →  tokens: [B,(H/4)*(W/4),C], H/4, W/4"""
-        x = self.act(self.norm(self.pw(self.dw(x))))
-        x = self.pe(x)  # [B,C,H/4,W/4]
-        B, C, H, W = x.shape
-        x = self.ln(x.flatten(2).transpose(1, 2))  # [B,H*W,C]
-        return x, H, W
+        # """x: [B,3,H,W]  →  tokens: [B,(H/4)*(W/4),C], H/4, W/4"""
+        # x = self.act(self.norm(self.pw(self.dw(x))))
+        # x = self.pe(x)  # [B,C,H/4,W/4]
+        # B, C, H, W = x.shape
+        # x = self.ln(x.flatten(2).transpose(1, 2))  # [B,H*W,C]
+        # return x, H, W
+        return x + self.out(self.act(self.pw(self.dw(x))))
 
 
 class EchogenicityChannelAttention(nn.Module):
@@ -237,14 +242,19 @@ class ThyFormer(nn.Module):
     # ── Forward ───────────────────────────────────────────────────
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """x: [B,3,H,W] with H,W divisible by the stem patch size"""
+        """x: [B,3,H,W] with H,W divisible by the Swin patch size (4)"""
+
         # Stage 1 — Despeckling stem
-        tokens, H, W = self.stem(x)  # [B,(H/4)*(W/4),96]
+        x_dn = self.stem(x)
 
-        # Stage 2 — Echogenicity attention
-        tokens, echo_w = self.eca(tokens)
+        # Stage 2 — Swin's pretrained patch embedding
+        tokens = self.swin.patch_embed(x_dn)
+        B, H, W, C = tokens.shape
 
-        # Stage 3 — Swin encoder
+        # Stage 3 — (variable) echo_w: Any
+        tokens, echo_w = self.eca(tokens.flatten(1, 2))
+
+        # Stage 4 - Swin encoder stages
         features = self._run_swin_stages(tokens, H, W)
 
         # Stage 4a — Classification

@@ -1,8 +1,7 @@
 import os
-import glob
+import csv
 
 import cv2
-import json
 import numpy as np
 from typing import List
 import torch
@@ -31,6 +30,10 @@ TIRADS_MAP = {
 CLASS_NAMES = ["TR-1", "TR-2", "TR-3", "TR-4", "TR-5"]
 NUM_CLASSES = 5
 
+# Images are stored separately from the split CSVs; the CSVs only carry bare
+# filenames (e.g. "61_37.jpg"). Same root the thyformer pipeline uses.
+IMAGE_ROOT = "/home/jiban/Documents/TI-RACS/stanford_dataset/images"
+
 
 BACKBONE_SIZE = {
     "convnext": 720,
@@ -38,6 +41,18 @@ BACKBONE_SIZE = {
     "swin": 720,
     "vit": 720,
 }
+
+
+def _parse_polygon(mask_str: str) -> List[dict]:
+    """Parse a "x,y;x,y;..." polygon string into [{"x": .., "y": ..}, ...],
+    the {x, y}-dict format polygon_to_mask expects."""
+    points = []
+    for pair in (mask_str or "").split(";"):
+        if "," not in pair:
+            continue
+        x, y = pair.split(",")[:2]
+        points.append({"x": int(x), "y": int(y)})
+    return points
 
 
 class ThyroidDataset(Dataset):
@@ -68,8 +83,9 @@ class ThyroidDataset(Dataset):
         elif split == "test":
             self.transform = build_val_transforms(self.img_size)
 
-        all_cases = self._load_all_cases()
-        self.cases = self._split(all_cases, train_ratio, val_ratio, seed, split)
+        # Splits are fixed on disk (train.csv/val.csv/test.csv), so no in-memory
+        # splitting is done; _split is kept below for other callers.
+        self.cases = self._load_all_cases()
 
         print(
             f"[ThyroidDataset] {split:5s} | {len(self.cases):4d} cases | "
@@ -78,29 +94,31 @@ class ThyroidDataset(Dataset):
         self._print_class_dist()
 
     def _load_all_cases(self) -> List[dict]:
-        ann_dir = os.path.join(self.data_dir, "jsons")
-        img_dir = os.path.join(self.data_dir, "images")
+        """Load the pre-split cases for self.split from <data_dir>/<split>.csv.
 
-        json_files = sorted(glob.glob(os.path.join(ann_dir, "*.json")))
-
-        if not json_files:
-            raise FileNotFoundError(f"No json files found in {ann_dir}")
+        Columns: img_path (bare filename), label ("TR-x"), mask (polygon
+        "x,y;x,y;..."). Images are resolved against IMAGE_ROOT. The clip-grouped
+        train/val/test split is fixed in these CSVs, so no splitting happens here.
+        """
+        csv_path = os.path.join(self.data_dir, f"{self.split}.csv")
+        if not os.path.isfile(csv_path):
+            raise FileNotFoundError(f"Split CSV not found: {csv_path}")
 
         cases = []
-
-        for json_path in json_files:
-            with open(json_path, "r") as f:
-                content = json.load(f)
-
-            label = TIRADS_MAP[str(content["tirads_raw"])]
-            content["label"] = label
-
-            img_path = os.path.join(img_dir, f'{content["frame_id"]}.jpg')
-            content["img_path"] = img_path
-            cases.append(content)
+        with open(csv_path, newline="") as f:
+            for row in csv.DictReader(f):
+                fname = os.path.basename(row["img_path"])
+                cases.append(
+                    {
+                        "frame_id": os.path.splitext(fname)[0],
+                        "img_path": os.path.join(IMAGE_ROOT, fname),
+                        "label": CLASS_NAMES.index(row["label"]),
+                        "polygon": _parse_polygon(row.get("mask", "")),
+                    }
+                )
 
         if not cases:
-            raise RuntimeError("No valid cases found. Check data_dir layout.")
+            raise RuntimeError(f"No cases found in {csv_path}")
 
         return cases
 

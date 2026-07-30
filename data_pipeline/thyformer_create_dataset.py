@@ -256,6 +256,21 @@ def build_dataloaders(
 
     sampler = build_weighted_sampler(train_ds)
 
+    # Mixup needs enough samples in a micro-batch to blend distinct images. Below
+    # aug_cfg.mixup_min_batch_size it is turned off (mixup_p = 0) and the collate
+    # still runs, so batches keep their one-hot soft-label format and the rest of
+    # the pipeline is unchanged. Note this is the DataLoader batch size, not the
+    # accumulated effective batch — collate_fn only ever sees one micro-batch.
+    min_bs = getattr(aug_cfg, "mixup_min_batch_size", 0)
+    mixup_p = aug_cfg.mixup_p
+    if batch_size < min_bs and mixup_p > 0:
+        print(
+            f"[dataloader] mixup disabled: batch_size={batch_size} < "
+            f"mixup_min_batch_size={min_bs} (randperm({batch_size}) is too "
+            f"degenerate to regularise; it only injects label noise)"
+        )
+        mixup_p = 0.0
+
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
@@ -263,9 +278,7 @@ def build_dataloaders(
         num_workers=num_workers,
         pin_memory=pin_memory,
         drop_last=True,
-        collate_fn=lambda b: mixup_collate(
-            b, aug_cfg.mixup_alpha, aug_cfg.mixup_p, data_cfg.num_classes
-        ),
+        collate_fn=lambda b: mixup_collate(b, aug_cfg.mixup_alpha, mixup_p, data_cfg.num_classes),
     )
     val_loader = DataLoader(
         val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory

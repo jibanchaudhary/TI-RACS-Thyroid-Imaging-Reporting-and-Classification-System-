@@ -8,7 +8,7 @@ both are evaluated, they are also compared head-to-head:
 
     <run>/thyformer/           ThyFormer's full evaluation
     <run>/<baseline_arch>/     the baseline's full evaluation (same artifacts)
-    <run>/comparison/          DeLong test + comparison figures (both models only)
+    <run>/comparison/          paired AUC test + comparison figures (both models only)
 
 Baseline dispatch — evaluate_one_model routes each --baseline name to its
 dedicated evaluator, all of which produce the same artifacts as ThyFormer's:
@@ -32,7 +32,8 @@ as ThyFormer, unchanged.
 Per-model artifacts (in each model's folder):
 
     metrics.json/.csv            scalar test metrics (incl. calibration + ordinal)
-    metrics_ci.json/.csv         bootstrap 95% CI for every scalar metric
+    metrics_clip_level.json/.csv same metrics with one row per clip (nodule)
+    metrics_ci.json/.csv         cluster-bootstrap 95% CI for every scalar metric
     predictions.csv              per-sample labels + probabilities
     classification_report.txt    precision/recall/F1/support
     per_class_metrics.csv/.png   AUC/AP/F1/sens/spec/precision/NPV per class
@@ -44,7 +45,8 @@ Per-model artifacts (in each model's folder):
 
 Comparison artifacts (only when both models are evaluated):
 
-    delong_test.json             significance of the macro-AUC difference
+    auc_comparison.json          significance of the macro-AUC difference
+                                 (paired CLUSTER bootstrap over clips — not DeLong's test)
     comparison_metrics.csv/.png  side-by-side metrics + grouped bars
     comparison_roc.png           macro-average ROC overlay
 
@@ -93,14 +95,17 @@ from models.thyformer_models import build_model, build_baseline_model, TimmClass
 from train.thyformer_train import amp_settings
 from utils.thyformer_explainability import run_gradcam_batch
 from utils.thyformer_metrics import (
+    aggregate_by_group,
     bootstrap_cis,
+    clip_ids,
     compute_calibration,
     compute_kappa,
     compute_metrics,
-    delong_test,
+    paired_auc_test,
     print_ci_table,
     print_comparison_table,
     print_results_table,
+    _scalar_metrics,
 )
 from utils import thyformer_report as report
 
@@ -236,7 +241,6 @@ def load_baseline(arch: str, path: str, cfg, device: str):
     ckpt = load_checkpoint(path, device)
     state = _state_dict_from(ckpt)
 
-    # Old-pipeline BackboneModel checkpoint (scripts/evaluate.py era)?
     if any(k.startswith("backbone.") for k in state) and "head.4.weight" in state:
         return _load_legacy_baseline(ckpt, state, cfg).to(device), ckpt
 
@@ -333,16 +337,33 @@ def _evaluate_model_core(
     calib, calib_bins = compute_calibration(labels, probs)
     report.save_reliability_diagram(out_dir, calib_bins, calib)
 
-    # Bootstrap 95% CIs for every scalar metric (percentile method).
+    # Bootstrap 95% CIs for every scalar metric (percentile method). Frames are
+    # video frames nested in clips, so resampling is done over CLIPS — a frame
+    # bootstrap treats ~29 nodules as ~3066 observations and reports intervals
+    # roughly 10x too narrow.
+    groups = clip_ids(stems)
+    n_clips = len(np.unique(groups))
     cis = None
     if n_bootstrap > 0:
-        print(f"Bootstrapping 95% CIs ({n_bootstrap} resamples) …")
-        cis = bootstrap_cis(labels, probs, n_bootstrap=n_bootstrap)
+        print(
+            f"Bootstrapping 95% CIs ({n_bootstrap} resamples, clustered over " f"{n_clips} clips) …"
+        )
+        cis = bootstrap_cis(labels, probs, n_bootstrap=n_bootstrap, groups=groups)
         report.save_metric_cis(out_dir, cis)
         print_ci_table(
             {k: v for k, v in cis.items() if "_t" not in k},  # headline metrics only
-            f"{model_name} — 95% CI (bootstrap, n={n_bootstrap})",
+            f"{model_name} — 95% CI (cluster bootstrap over {n_clips} clips)",
         )
+
+    # Clip-level view: one row per nodule (mean probability over its frames), so
+    # a 293-frame clip does not outweigh a 25-frame one.
+    y_clip, probs_clip, _ = aggregate_by_group(labels, probs, groups)
+    clip_metrics = {f"test_{k}": v for k, v in _scalar_metrics(y_clip, probs_clip).items()}
+    report.save_metrics(out_dir, clip_metrics, stem="metrics_clip_level")
+    print_results_table(
+        {k: v for k, v in clip_metrics.items() if "_t" not in k},
+        f"{model_name} — clip-level test results (n={n_clips} nodules)",
+    )
 
     if n_gradcam > 0:
         print(f"Generating {n_gradcam} GradCAM figures …")
@@ -353,10 +374,13 @@ def _evaluate_model_core(
     return {
         "name": model_name,
         "metrics": metrics,
+        "clip_metrics": clip_metrics,
         "probs": probs,
         "preds": preds,
         "labels": labels,
         "stems": stems,
+        "groups": groups,
+        "n_clips": n_clips,
         "cis": cis,
     }
 
@@ -706,19 +730,48 @@ def run_evaluation(args):
     if thy_out and base_out:
         base_name = base_out["name"]
         if not np.array_equal(thy_out["labels"], base_out["labels"]):
-            print("WARNING: label order differs between models — DeLong assumes aligned samples.")
+            print(
+                "WARNING: label order differs between models — the paired test "
+                "assumes both were scored on the same samples in the same order."
+            )
 
         print(f"\n{'='*60}\n  Comparison: ThyFormer vs {base_name}\n{'='*60}")
-        auc_a, auc_b, z, p_val = delong_test(thy_out["labels"], thy_out["probs"], base_out["probs"])
+        groups = thy_out["groups"]
+        n_clips = thy_out["n_clips"]
+        print(
+            f"Paired cluster bootstrap over {n_clips} clips "
+            f"({len(groups)} frames) — frames within a clip are not independent."
+        )
+        test = paired_auc_test(
+            thy_out["labels"],
+            thy_out["probs"],
+            base_out["probs"],
+            n_bootstrap=args.n_bootstrap or 1000,
+            groups=groups,
+        )
+        p_val = test["p_value"]
+        auc_a, auc_b, z = test["auc_a"], test["auc_b"], test["z_statistic"]
         delong_results = {
             "model_a": "ThyFormer",
             "model_b": base_name,
             "thyformer_auc": auc_a,
             "baseline_auc": auc_b,
-            "auc_difference": auc_a - auc_b,
+            "auc_difference": test["auc_difference"],
+            "diff_ci_low": test["diff_ci_low"],
+            "diff_ci_high": test["diff_ci_high"],
             "z_statistic": z,
             "p_value": p_val,
             "significant_at_0.05": bool(p_val < 0.05),
+            # Provenance for the statistic itself: this is a paired cluster
+            # bootstrap over clips, NOT DeLong's test, and the number of
+            # independent units is n_units — not n_samples.
+            "method": test["method"],
+            "resampling_unit": test["unit"],
+            "n_units": test["n_units"],
+            "n_samples": test["n_samples"],
+            "n_bootstrap_used": test["n_bootstrap_used"],
+            "thyformer_auc_clip_level": thy_out["clip_metrics"].get("test_auc"),
+            "baseline_auc_clip_level": base_out["clip_metrics"].get("test_auc"),
             "thyformer_checkpoint": args.checkpoint,
             "baseline_checkpoint": base_out["checkpoint_path"],
             "baseline_arch": base_name,
@@ -736,13 +789,26 @@ def run_evaluation(args):
             delong_results,
         )
         print_comparison_table(["ThyFormer", base_name], [thy_out["metrics"], base_out["metrics"]])
-        print("\nDeLong's test (macro AUC):")
-        print(f"  ThyFormer AUC : {auc_a:.4f}")
-        print(f"  {base_name} AUC : {auc_b:.4f}")
-        print(f"  z-statistic   : {z:.3f}")
+        print(f"\nPaired cluster bootstrap on macro AUC (unit: clip, n={test['n_units']}):")
+        print(
+            f"  ThyFormer AUC : {auc_a:.4f}   (clip-level {thy_out['clip_metrics']['test_auc']:.4f})"
+        )
+        print(
+            f"  {base_name} AUC : {auc_b:.4f}   (clip-level {base_out['clip_metrics']['test_auc']:.4f})"
+        )
+        print(
+            f"  Δ AUC         : {test['auc_difference']:+.4f}  "
+            f"95% CI [{test['diff_ci_low']:+.4f}, {test['diff_ci_high']:+.4f}]"
+        )
         print(
             f"  p-value       : {p_val:.4f}  ({'significant' if p_val<0.05 else 'n.s.'} at α=0.05)"
         )
+        if test["n_units"] < 50:
+            print(
+                f"  ⚠ only {test['n_units']} independent clips — this design cannot "
+                f"resolve small AUC differences; treat a non-significant result as "
+                f"'underpowered', not 'equivalent'."
+            )
 
     # The model whose predictions feed the run-level artifacts (kappa, metadata):
     # ThyFormer when evaluated, otherwise the baseline.
@@ -860,15 +926,34 @@ def _write_readme(run_dir, thy_out, base_out, delong, kappa, args) -> None:
         verdict = "significant" if delong["significant_at_0.05"] else "not significant"
         lines += [
             "",
-            "## Comparison — DeLong's test (macro AUC)",
+            "## Comparison — paired cluster bootstrap (macro AUC)",
             "",
             f"- Baseline: `{delong['baseline_checkpoint']}` ({delong['baseline_arch']})",
             f"- ThyFormer AUC **{delong['thyformer_auc']:.4f}** vs "
             f"{delong['baseline_arch']} **{delong['baseline_auc']:.4f}** "
-            f"(Δ = {delong['auc_difference']:+.4f})",
-            f"- z = {delong['z_statistic']:.3f}, p = {delong['p_value']:.4f} → "
-            f"difference is **{verdict}** at α = 0.05",
+            f"(Δ = {delong['auc_difference']:+.4f}, 95% CI "
+            f"{delong['diff_ci_low']:+.4f} to {delong['diff_ci_high']:+.4f})",
+            f"- p = {delong['p_value']:.4f} → difference is **{verdict}** at α = 0.05",
+            "",
+            f"> Resampling unit: **{delong['resampling_unit']}** — "
+            f"{delong['n_units']} independent clips behind {delong['n_samples']} frames. "
+            "Frames from one clip are near-duplicate views of the same nodule, so they "
+            "are resampled together. This is a paired cluster bootstrap, **not DeLong's "
+            "test**; a frame-level bootstrap understates the standard error by roughly "
+            "sqrt(frames/clips) and reports spuriously tiny p-values.",
         ]
+        if delong.get("thyformer_auc_clip_level") is not None:
+            lines.append(
+                f"> Clip-level macro AUC (one row per nodule, mean probability): "
+                f"ThyFormer {delong['thyformer_auc_clip_level']:.4f} vs "
+                f"{delong['baseline_arch']} {delong['baseline_auc_clip_level']:.4f}."
+            )
+        if delong["n_units"] < 50:
+            lines.append(
+                f"> **Underpowered:** {delong['n_units']} clips cannot resolve small AUC "
+                "differences. A non-significant result here means *not measurable*, not "
+                "*equivalent*."
+            )
     if kappa:
         lines += [
             "",
@@ -895,7 +980,7 @@ def _write_readme(run_dir, thy_out, base_out, delong, kappa, args) -> None:
         )
     if delong:
         lines.append(
-            "- `comparison/` — `delong_test.json`, `comparison_metrics.csv`/`.png`, `comparison_roc.png`"
+            "- `comparison/` — `auc_comparison.json`, `comparison_metrics.csv`/`.png`, `comparison_roc.png`"
         )
     if kappa:
         lines.append("- `clinical_agreement.json` — Cohen's κ vs radiologist grades")

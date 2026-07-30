@@ -9,6 +9,7 @@ allowing stable early convergence before boundary precision is enforced.
 The boundary loss forces the model to attend to nodule margins —
 the critical region for T2↔T3 confusion in TI-RADS scoring.
 """
+import warnings
 from typing import Dict, Optional
 
 import torch
@@ -52,9 +53,11 @@ class SoftCrossEntropyLoss(nn.Module):
             smooth = self.label_smoothing / self.num_classes
             targets = targets * (1 - self.label_smoothing) + smooth
 
-        log_p = F.log_softmax(logits, dim=-1)
-        w = self.class_weights.to(logits.device)
-        loss = -(targets * log_p * w.unsqueeze(0)).sum(dim=-1).mean()
+        # log_softmax in fp32: under bf16 autocast the logits carry only ~2-3
+        # decimal digits, which shows up directly in the reported loss.
+        log_p = F.log_softmax(logits.float(), dim=-1)
+        w = self.class_weights.to(log_p.device, dtype=log_p.dtype)
+        loss = -(targets.to(log_p.dtype) * log_p * w.unsqueeze(0)).sum(dim=-1).mean()
         return loss
 
 
@@ -74,11 +77,16 @@ class DiceLoss(nn.Module):
         self.smooth = smooth
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        probs = torch.sigmoid(logits)
+        # fp32 throughout: under bf16 autocast the reductions below run over
+        # ~500k pixels per sample, where bf16's 8-bit mantissa loses accuracy and
+        # near-1.0 values are not resolvable. Cost is negligible (one cast).
+        probs = torch.sigmoid(logits.float())
         p_flat = probs.view(probs.size(0), -1)
-        t_flat = targets.float().view(targets.size(0), -1)
+        t_flat = targets.float().view(targets.size(0), -1).clamp(0.0, 1.0)
         inter = (p_flat * t_flat).sum(dim=1)
-        denom = p_flat.sum(dim=1) + t_flat.sum(dim=1)
+        # clamp_min keeps the ratio finite even if both sums underflow to 0 (an
+        # empty target mask paired with an all-zero prediction).
+        denom = (p_flat.sum(dim=1) + t_flat.sum(dim=1)).clamp_min(0.0)
         dice = (2 * inter + self.smooth) / (denom + self.smooth)
         return 1.0 - dice.mean()
 
@@ -114,12 +122,23 @@ class MedSAMBoundaryLoss(nn.Module):
         return (dilated - eroded).clamp(0, 1)
 
     def forward(self, seg_logits: torch.Tensor, medsam_boundary: torch.Tensor) -> torch.Tensor:
-        pred_mask = torch.sigmoid(seg_logits)  # [B,1,H,W]
+        # ── fp32 is REQUIRED here, not an optimisation ────────────────────────
+        # This term was the source of `val_loss = inf` at epochs 6/8/9. Under
+        # bf16 autocast the Python float `1 - 1e-6` rounds to *exactly 1.0*
+        # (bf16 has 8 mantissa bits, so the spacing near 1.0 is 2^-8), which
+        # makes the upper clamp below a no-op. `pred_bd` reaches exactly 1.0 as
+        # soon as sigmoid(seg_logits) saturates — which is what happens once the
+        # seg head grows confident, hence the failure appearing only at later
+        # epochs — and then log(1 - 1.0) = -inf poisons the whole composite loss.
+        # fp16 has the same defect; fp32 resolves 1-1e-6 correctly.
+        pred_mask = torch.sigmoid(seg_logits.float())  # [B,1,H,W]
         pred_bd = self._boundary(pred_mask)
-        target_bd = medsam_boundary.float().to(seg_logits.device)
+        target_bd = medsam_boundary.float().to(pred_bd.device).clamp(0.0, 1.0)
         weight = 1.0 + (self.bw - 1.0) * target_bd
-        pred_bd = pred_bd.clamp(1e-6, 1 - 1e-6)
-        bce = -(target_bd * torch.log(pred_bd) + (1 - target_bd) * torch.log(1 - pred_bd))
+        eps = 1e-6
+        pred_bd = pred_bd.clamp(eps, 1.0 - eps)
+        # log1p(-p) is the accurate form of log(1-p) as p -> 0.
+        bce = -(target_bd * torch.log(pred_bd) + (1.0 - target_bd) * torch.log1p(-pred_bd))
         return (weight * bce).mean()
 
 
@@ -137,6 +156,10 @@ class ThyFormerLoss(nn.Module):
         num_classes:   5 (T1–T5)
         class_weights: [5] tensor for imbalance correction
     """
+
+    # Class-level so the empty-boundary warning fires once per process, not once
+    # per batch (it would otherwise print thousands of times per epoch).
+    _warned_empty_boundary = False
 
     def __init__(
         self, cfg: LossConfig, num_classes: int = 5, class_weights: Optional[torch.Tensor] = None
@@ -172,6 +195,27 @@ class ThyFormerLoss(nn.Module):
         l_dice = self.dice(preds["seg_logits"], targets["mask"])
         gamma = self._gamma(epoch)
         l_bnd = self.bnd(preds["seg_logits"], targets["boundary"])
+
+        # ── Guard: an all-zero boundary target supervises nothing ─────────────
+        # Every file in stanford_dataset/med_sam is identically zero, so this
+        # term degenerates to "drive the predicted boundary to 0 everywhere",
+        # i.e. predict a spatially uniform mask — which directly opposes L_dice.
+        # Rather than train against a vacuous target, drop the term and say so
+        # once. Regenerate the MedSAM maps (data_pipeline/thyformer_medsam.py) or
+        # set LossConfig.gamma = 0.0 to silence this deliberately.
+        if gamma > 0.0 and float(targets["boundary"].abs().max()) == 0.0:
+            if not ThyFormerLoss._warned_empty_boundary:
+                ThyFormerLoss._warned_empty_boundary = True
+                warnings.warn(
+                    "MedSAM boundary target is all zeros — L_boundary is supervising "
+                    "against an empty map and would push the seg head toward a "
+                    "boundary-free mask. Dropping the boundary term for this run. "
+                    "Regenerate stanford_dataset/med_sam or set LossConfig.gamma=0.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            gamma = 0.0
+
         l_tot = self.alpha * l_ce + self.beta * l_dice + gamma * l_bnd
 
         return {
