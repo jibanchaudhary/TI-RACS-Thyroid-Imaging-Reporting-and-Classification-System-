@@ -91,7 +91,12 @@ from tqdm import tqdm
 
 from configs.thyformer_config import get_config
 from data_pipeline.thyformer_create_dataset import build_dataloaders
-from models.thyformer_models import build_model, build_baseline_model, TimmClassifier
+from models.thyformer_models import (
+    build_model,
+    build_baseline_model,
+    model_cfg_for_checkpoint,
+    TimmClassifier,
+)
 from train.thyformer_train import amp_settings
 from utils.thyformer_explainability import run_gradcam_batch
 from utils.thyformer_metrics import (
@@ -694,8 +699,12 @@ def run_evaluation(args):
     # ── ThyFormer: independent full evaluation ────────────────────
     thy_out = thy_model = thy_ckpt = None
     if args.checkpoint:
-        thy_model = build_model(cfg.model)
         thy_ckpt = load_checkpoint(args.checkpoint, device)
+        # Rebuild the architecture the checkpoint was trained under. eca_gate in
+        # particular changes the ECA block's function without changing any
+        # parameter shape, so loading a legacy checkpoint into today's default
+        # would load cleanly and silently score a different model.
+        thy_model = build_model(model_cfg_for_checkpoint(thy_ckpt, cfg.model))
         thy_model.load_state_dict(_state_dict_from(thy_ckpt))
         thy_model = thy_model.to(device)
         thy_out = evaluate_one_model(

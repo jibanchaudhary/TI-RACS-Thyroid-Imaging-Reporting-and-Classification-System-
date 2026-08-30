@@ -39,16 +39,62 @@ def amp_settings(cfg: ThyFormerConfig):
     return enabled, dtype
 
 
+def _is_no_decay(name: str, param) -> bool:
+    """
+    1-D parameters — LayerNorm/BatchNorm gains, every bias, and the relative
+    position-bias tables — get no weight decay. Decaying a normalisation gain
+    toward zero shrinks the layer's output scale for no regularisation benefit,
+    and it is the standard exclusion in every transformer training recipe.
+    """
+    return param.ndim <= 1 or name.endswith(".bias") or "relative_position_bias_table" in name
+
+
 def build_optimizer(model: ThyFormer, cfg: ThyFormerConfig) -> AdamW:
-    groups = model.get_param_groups()
-    return AdamW(
-        [
-            {"params": groups["backbone"], "lr": cfg.training.lr_backbone},
-            {"params": groups["head"], "lr": cfg.training.lr_head},
-        ],
-        weight_decay=cfg.training.weight_decay,
-        betas=cfg.training.betas,
-    )
+    """
+    Four param groups: {backbone, head} x {decay, no_decay}.
+
+    Every group carries an `lr_key` of "backbone" or "head". apply_warmup ramps
+    by that tag rather than by group index, so splitting one LR group into a
+    decay/no-decay pair cannot leave half the parameters pinned at a constant LR
+    through warmup.
+    """
+    wd = cfg.training.weight_decay
+    exclude = getattr(cfg.training, "wd_exclude_norm_bias", True)
+
+    buckets = {
+        ("backbone", True): [],
+        ("backbone", False): [],
+        ("head", True): [],
+        ("head", False): [],
+    }
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        kind = "backbone" if "swin" in name else "head"
+        decay = not (exclude and _is_no_decay(name, p))
+        buckets[(kind, decay)].append(p)
+
+    lr_bb, lr_h = cfg.training.lr_backbone, cfg.training.lr_head
+    groups = [
+        {
+            "params": buckets[("backbone", True)],
+            "lr": lr_bb,
+            "weight_decay": wd,
+            "lr_key": "backbone",
+        },
+        {"params": buckets[("head", True)], "lr": lr_h, "weight_decay": wd, "lr_key": "head"},
+        {
+            "params": buckets[("backbone", False)],
+            "lr": lr_bb,
+            "weight_decay": 0.0,
+            "lr_key": "backbone",
+        },
+        {"params": buckets[("head", False)], "lr": lr_h, "weight_decay": 0.0, "lr_key": "head"},
+    ]
+    n_nodecay = sum(p.numel() for g in groups[2:] for p in g["params"])
+    if exclude:
+        print(f"  weight decay excluded from {n_nodecay/1e3:.1f}K norm/bias params")
+    return AdamW(groups, betas=cfg.training.betas)
 
 
 def accum_steps(cfg: ThyFormerConfig) -> int:
@@ -90,10 +136,18 @@ def set_backbone_frozen(model: ThyFormer, frozen: bool) -> int:
 
 
 def apply_warmup(opt: AdamW, step: int, warmup_steps: int, lr_bb: float, lr_h: float):
-    if step < warmup_steps:
-        f = step / max(warmup_steps, 1)
-        opt.param_groups[0]["lr"] = lr_bb * f
-        opt.param_groups[1]["lr"] = lr_h * f
+    """Linear LR ramp over the first `warmup_steps` OPTIMISER steps.
+
+    Groups are tagged with `lr_key` by build_optimizer rather than addressed by
+    index, so the decay/no-decay split cannot silently leave half the parameters
+    at a constant LR through warmup.
+    """
+    if step >= warmup_steps:
+        return
+    f = step / max(warmup_steps, 1)
+    for g in opt.param_groups:
+        base = lr_bb if g.get("lr_key", "backbone") == "backbone" else lr_h
+        g["lr"] = base * f
 
 
 class EarlyStopping:
@@ -245,6 +299,24 @@ class CheckpointManager:
         return self.saved[0][1] if self.saved else None
 
 
+def _targets(batch: Dict, device) -> Dict[str, torch.Tensor]:
+    """Move the supervision tensors of one batch to the device.
+
+    `descriptors` carries the five ACR TI-RADS findings for the auxiliary heads.
+    It is absent from batches produced by older dataset versions, so it stays
+    optional and the loss falls back to a zero term.
+    """
+    t = {
+        k: batch[k].to(device, non_blocking=True)
+        for k in ("label", "mask", "boundary")
+        if k in batch
+    }
+    t["descriptors"] = (
+        batch["descriptors"].to(device, non_blocking=True) if "descriptors" in batch else None
+    )
+    return t
+
+
 def train_one_epoch(
     model, loader, opt, loss_fn, scaler, scheduler, epoch, cfg, global_step, logger
 ):
@@ -290,13 +362,12 @@ def train_one_epoch(
 
     for step, batch in enumerate(loader):
         imgs = batch["image"].to(device, non_blocking=True)
-        lbs = batch["label"].to(device, non_blocking=True)
-        msks = batch["mask"].to(device, non_blocking=True)
-        bnds = batch["boundary"].to(device, non_blocking=True)
+        tgts = _targets(batch, device)
+        lbs = tgts["label"]
 
         with autocast(device_type="cuda", dtype=amp_dtype, enabled=amp_enabled):
             preds = model(imgs)
-            losses = loss_fn(preds, {"label": lbs, "mask": msks, "boundary": bnds}, epoch=epoch)
+            losses = loss_fn(preds, tgts, epoch=epoch)
             loss = losses["loss_total"]
 
         # Skip non-finite batches so one bad step can't corrupt the weights. A
@@ -347,13 +418,12 @@ def evaluate(model, loader, loss_fn, epoch, prefix="val", cfg=None):
 
     for batch in loader:
         imgs = batch["image"].to(device, non_blocking=True)
-        lbs = batch["label"].to(device, non_blocking=True)
-        msks = batch["mask"].to(device, non_blocking=True)
-        bnds = batch["boundary"].to(device, non_blocking=True)
+        tgts = _targets(batch, device)
+        lbs = tgts["label"]
         amp_enabled, amp_dtype = amp_settings(cfg) if cfg else (False, torch.float16)
         with autocast(device_type="cuda", dtype=amp_dtype, enabled=amp_enabled):
             preds = model(imgs)
-            losses = loss_fn(preds, {"label": lbs, "mask": msks, "boundary": bnds}, epoch=epoch)
+            losses = loss_fn(preds, tgts, epoch=epoch)
         total_loss += losses["loss_total"].item()
         all_logits.append(preds["cls_logits"].float().cpu())
         hard = lbs.argmax(1) if lbs.dim() == 2 else lbs
@@ -580,14 +650,25 @@ if __name__ == "__main__":
     # Import here to avoid circular imports at module level
     from data_pipeline.thyformer_create_dataset import build_dataloaders
     from models.thyformer_models import build_model
-    from utils.thyformer_loss import build_loss
+    from utils.thyformer_loss import build_class_weights, build_loss
 
     # Build everything
     model = build_model(cfg.model)
-    loss_fn = build_loss(cfg.loss)
     loaders = build_dataloaders(
         cfg.data, cfg.augmentation, cfg.training.batch_size, cfg.training.num_workers
     )
+
+    # cfg.loss.use_class_weights was previously declared but never read —
+    # build_loss(cfg.loss) was called with no weights at all. It is honoured now,
+    # and build_class_weights returns None under a balanced sampler so the
+    # imbalance is never corrected twice.
+    cw = (
+        build_class_weights(loaders["train"].dataset.labels, cfg.data.num_classes, cfg.data.sampler)
+        if cfg.loss.use_class_weights
+        else None
+    )
+    print(f"Class weights: {'none (sampler is balanced)' if cw is None else cw.tolist()}")
+    loss_fn = build_loss(cfg.loss, cfg.data.num_classes, cw)
 
     # Train
     results = train(model, loaders, loss_fn, cfg, resume_from=args.resume)

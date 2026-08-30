@@ -10,7 +10,7 @@ The boundary loss forces the model to attend to nodule margins —
 the critical region for T2↔T3 confusion in TI-RADS scoring.
 """
 import warnings
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -59,6 +59,115 @@ class SoftCrossEntropyLoss(nn.Module):
         w = self.class_weights.to(log_p.device, dtype=log_p.dtype)
         loss = -(targets.to(log_p.dtype) * log_p * w.unsqueeze(0)).sum(dim=-1).mean()
         return loss
+
+
+# ─────────────────────────────────────────────────────────────────
+# L_desc — ACR TI-RADS descriptor multi-task loss  ★ NOVEL
+# ─────────────────────────────────────────────────────────────────
+
+
+class DescriptorLoss(nn.Module):
+    """
+    Mean cross-entropy over the five ACR TI-RADS descriptors.
+
+    Targets arrive as [B,5,MAX_BINS] soft one-hot (so Mixup can interpolate them)
+    with an all-zero row marking "this clip has no annotation for this
+    descriptor". Masking on the row sum rather than a sentinel index means a
+    mixup blend of an annotated and an unannotated frame contributes at its
+    partial weight instead of being dropped or, worse, supervised toward class 0.
+
+    Each descriptor's logits are [B,bins_i] with bins_i <= MAX_BINS, so the target
+    is sliced to the head's own width before the CE.
+    """
+
+    def __init__(self, echo_index: int = 1):
+        super().__init__()
+        # Which descriptor the ECA block's own echo head predicts.
+        self.echo_index = echo_index
+
+    @staticmethod
+    def _masked_ce(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        w = target.sum(dim=-1)  # [B] — 0 where unannotated
+        if float(w.sum()) <= 0.0:
+            return logits.sum() * 0.0
+        log_p = F.log_softmax(logits.float(), dim=-1)
+        ce = -(target.to(log_p.dtype) * log_p).sum(dim=-1)  # [B]
+        return ce.sum() / w.sum().clamp_min(1e-8)
+
+    def forward(
+        self,
+        descriptor_logits: Optional[List[torch.Tensor]],
+        echo_logits: Optional[torch.Tensor],
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        if target.dim() == 2:  # [B,5] hard indices (val/test default collate)
+            n_bins = max(
+                [t.shape[-1] for t in descriptor_logits]
+                if descriptor_logits
+                else [0] + ([echo_logits.shape[-1]] if echo_logits is not None else [0])
+            )
+            oh = torch.zeros(*target.shape, n_bins, device=target.device)
+            valid = target >= 0
+            oh.scatter_(2, target.clamp_min(0).unsqueeze(-1), valid.unsqueeze(-1).float())
+            target = oh
+
+        terms = []
+        if descriptor_logits is not None:
+            for i, lg in enumerate(descriptor_logits):
+                terms.append(self._masked_ce(lg, target[:, i, : lg.shape[-1]]))
+        if echo_logits is not None:
+            # The ECA head predicts echogenicity from the *early* tokens, where an
+            # intensity property actually lives, rather than from stage-4
+            # semantics. Supervising it here is what gives it a gradient at all.
+            terms.append(
+                self._masked_ce(echo_logits, target[:, self.echo_index, : echo_logits.shape[-1]])
+            )
+        if not terms:
+            return torch.zeros((), device=target.device)
+        return torch.stack(terms).mean()
+
+
+# ─────────────────────────────────────────────────────────────────
+# L_corn — Ordinal (CORN) loss for the graded TI-RADS scale
+# ─────────────────────────────────────────────────────────────────
+
+
+class CornLoss(nn.Module):
+    """
+    Conditional ordinal regression loss (CORN).
+
+    For task k ("is the grade > k?") the loss is a binary cross-entropy taken
+    only over the samples whose true grade already exceeds k-1 — that
+    conditioning is what makes the K-1 heads model P(y>k | y>k-1) rather than
+    K-1 unrelated binary problems, and is why the resulting cumulative
+    probabilities are monotone without a rank constraint.
+
+    Accepts soft (Mixup) targets: the conditioning mask and the BCE target are
+    both taken as expectations under the mixed label, so a blended TR-3/TR-5
+    frame supervises the intermediate tasks proportionally instead of being
+    snapped to one grade.
+    """
+
+    def __init__(self, num_classes: int = 5):
+        super().__init__()
+        self.num_classes = num_classes
+
+    def forward(self, q: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        K = self.num_classes
+        q = q.float()
+        if targets.dim() == 1:
+            targets = F.one_hot(targets, K).float()
+        targets = targets.to(q.dtype)
+
+        # P(y > k) under the (possibly soft) target, k = 0 … K-2
+        surv = targets.flip(-1).cumsum(-1).flip(-1)[:, 1:]  # [B,K-1]
+        # Conditioning weight for task k is P(y > k-1); task 0 is unconditional.
+        cond = torch.cat([torch.ones_like(surv[:, :1]), surv[:, :-1]], dim=1)
+
+        bce = F.binary_cross_entropy_with_logits(q, surv.clamp(0, 1), reduction="none")
+        # Normalise by the total conditioning mass so the scale does not drift
+        # with the class mix of the batch.
+        return (cond * bce).sum() / cond.sum().clamp_min(1e-8)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -168,10 +277,13 @@ class ThyFormerLoss(nn.Module):
         self.alpha = cfg.alpha
         self.beta = cfg.beta
         self.gamma_max = cfg.gamma
+        self.delta = getattr(cfg, "delta", 0.0)
         self.warmup = cfg.boundary_warmup_epochs
         self.ce = SoftCrossEntropyLoss(num_classes, cfg.label_smoothing, class_weights)
+        self.corn = CornLoss(num_classes)
         self.dice = DiceLoss()
         self.bnd = MedSAMBoundaryLoss()
+        self.desc = DescriptorLoss()
 
     def _gamma(self, epoch: int) -> float:
         """Linear warmup: 0 at epoch 0 → gamma_max at warmup."""
@@ -191,10 +303,27 @@ class ThyFormerLoss(nn.Module):
             mask        [B,1,H,W]
             boundary    [B,1,H,W]
         """
-        l_ce = self.ce(preds["cls_logits"], targets["label"])
+        # With the CORN head the classification term is the ordinal loss on the
+        # raw conditional logits. `cls_logits` is then log-probabilities, so
+        # running SoftCrossEntropyLoss on it would still "work" but would
+        # optimise a different (non-monotone) objective.
+        if "ordinal_logits" in preds:
+            l_ce = self.corn(preds["ordinal_logits"], targets["label"])
+        else:
+            l_ce = self.ce(preds["cls_logits"], targets["label"])
         l_dice = self.dice(preds["seg_logits"], targets["mask"])
         gamma = self._gamma(epoch)
         l_bnd = self.bnd(preds["seg_logits"], targets["boundary"])
+
+        # ACR descriptor auxiliary task. Zero when delta == 0 or the batch carries
+        # no descriptor target, in which case the ECA echo head goes back to
+        # receiving no gradient — which is exactly the ablation baseline.
+        if self.delta > 0.0 and targets.get("descriptors") is not None:
+            l_echo = self.desc(
+                preds.get("descriptor_logits"), preds.get("echo_weights"), targets["descriptors"]
+            )
+        else:
+            l_echo = torch.zeros((), device=l_ce.device, dtype=l_ce.dtype)
 
         # ── Guard: an all-zero boundary target supervises nothing ─────────────
         # Every file in stanford_dataset/med_sam is identically zero, so this
@@ -216,15 +345,37 @@ class ThyFormerLoss(nn.Module):
                 )
             gamma = 0.0
 
-        l_tot = self.alpha * l_ce + self.beta * l_dice + gamma * l_bnd
+        l_tot = self.alpha * l_ce + self.beta * l_dice + gamma * l_bnd + self.delta * l_echo
 
         return {
             "loss_total": l_tot,
             "loss_ce": l_ce,
             "loss_dice": l_dice,
             "loss_boundary": l_bnd,
+            "loss_desc": l_echo,
             "boundary_weight": torch.tensor(gamma),
         }
+
+
+def build_class_weights(
+    labels, num_classes: int = 5, sampler: str = "clip"
+) -> Optional[torch.Tensor]:
+    """
+    Inverse-frequency class weights, normalised to mean 1.
+
+    Returns None when the sampler is already class-balanced ("clip"/"frame"):
+    stacking inverse-frequency weights on top of a balanced sampler corrects the
+    imbalance twice and over-weights the rare grades by their frequency ratio
+    squared. Only a "none" sampler leaves the imbalance for the loss to handle.
+    """
+    if sampler in ("clip", "frame"):
+        return None
+    import numpy as np
+
+    counts = np.bincount(np.asarray(labels), minlength=num_classes).astype(np.float64)
+    w = np.where(counts > 0, 1.0 / np.maximum(counts, 1), 0.0)
+    w = w / w[w > 0].mean()
+    return torch.tensor(w, dtype=torch.float32)
 
 
 def build_loss(
