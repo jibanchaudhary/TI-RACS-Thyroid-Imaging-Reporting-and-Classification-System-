@@ -12,7 +12,9 @@ TI-RACS classifies thyroid ultrasound images into the five ACR TI-RADS categorie
 
 ## Demo
 
-https://github.com/user-attachments/assets/150b5544-d6e6-470e-9769-28fedc1d5b0a
+
+https://github.com/user-attachments/assets/0b039872-be41-4ddd-a87a-0ee6ad3fe3a0
+
 
 ---
 
